@@ -106,8 +106,9 @@ namespace PTor
             var udp = _udp;
             if (udp == null) return;
             var qname = GetQueryName(query);
-            // In-app blocklist: answer locally so blocked names never reach an exit.
-            if (qname != null && (IsLocalBlock(qname) || AdBlockStore.Instance.IsBlocked(qname)))
+            // Special-use/local names are answered locally so they never
+            // reach an exit. Nothing else is blocked here.
+            if (qname != null && IsLocalBlock(qname))
             {
                 var nx = BuildNxDomain(query);
                 Interlocked.Increment(ref _blocked);
@@ -179,8 +180,7 @@ namespace PTor
                     var query = new byte[len];
                     if (!await TryReadAsync(stream, query, ct)) return;
                     var qname = GetQueryName(query);
-                    // In-app blocklist: answer locally so blocked names never reach an exit.
-                    if (qname != null && (IsLocalBlock(qname) || AdBlockStore.Instance.IsBlocked(qname)))
+                    if (qname != null && IsLocalBlock(qname))
                     {
                         var nx = BuildNxDomain(query);
                         Interlocked.Increment(ref _blocked);

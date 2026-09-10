@@ -32,8 +32,9 @@ offline. Fix it in this order:
 
 ## Notes
 
-- PTor never touches the OS `hosts` file. Ad/tracker blocking happens
-  entirely inside PTor's own DNS and relays (in-memory, gone on exit).
+- PTor never touches the OS `hosts` file. There is no filter-list adblocking;
+  only your own manual Blocked Domains list (Config) is enforced, plus
+  internal-only names that must never leave the machine.
 - PTor installs exactly one WinDivert driver service, only while Tor-only
   lockdown is on, and removes it on stop. It never touches another app's
   driver.

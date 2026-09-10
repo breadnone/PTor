@@ -220,15 +220,6 @@ namespace PTor
             host = hostPart.Trim().Trim('[', ']').Trim();
             if (host.Length == 0) return;
 
-            // In-app blocklist: refuse locally, never open upstream.
-            if (!System.Net.IPAddress.TryParse(host, out _) && AdBlockStore.Instance.IsBlocked(host))
-            {
-                var denied = Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-                try { await clientStream.WriteAsync(denied, hs); } catch { }
-                OnRelayed(host, port, "BLOCKED");
-                return;
-            }
-
             using var socksClient = await SocksUpstream.ConnectWithRetryAsync(
                 _socksHost, _socksPort, host, port,
                 s => Socks5Connect(s, host, port, hs), hs);
@@ -347,14 +338,6 @@ namespace PTor
                 // not a silent drop (and never forwarded upstream).
                 var bad = Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
                 try { await clientStream.WriteAsync(bad, hs); } catch { }
-                return;
-            }
-            // In-app blocklist: refuse locally, never open upstream.
-            if (!System.Net.IPAddress.TryParse(uri.Host, out _) && AdBlockStore.Instance.IsBlocked(uri.Host))
-            {
-                var denied = Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-                try { await clientStream.WriteAsync(denied, hs); } catch { }
-                OnRelayed(uri.Host, uri.Port, "BLOCKED");
                 return;
             }
             using var socksClient = await SocksUpstream.ConnectWithRetryAsync(

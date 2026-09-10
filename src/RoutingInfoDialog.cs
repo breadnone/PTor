@@ -20,15 +20,11 @@ namespace PTor
         readonly AppSettings _settings;
         readonly Func<string, string?> _applyUserAgent;
         readonly Action<string> _status;
-        readonly ObservableCollection<string> _blockFiles = new();
         TextBlock _proxyStatus;
         TextBlock _linkStatus;
         TextBlock _verifyResult;
         ListBox _domainListBox;
         TextBox _domainInput;
-        ListBox _blockFileList;
-        TextBox _blockUrlInput;
-        TextBlock _blocklistStatus;
         TextBox _userAgentInput;
         TextBlock _enforceStatus;
         TextBlock _dnsStatus;
@@ -55,9 +51,6 @@ namespace PTor
             _applyUserAgent = applyUserAgent;
             _status = statusCallback;
             _requestRestartAsAdmin = requestRestartAsAdmin;
-            foreach (var f in _settings.BlocklistUrls ?? new System.Collections.Generic.List<string>())
-                if (!_blockFiles.Contains(f))
-                    _blockFiles.Add(f);
 
             Title = "Config — routing, blocking & identity";
             Width = 920;
@@ -271,7 +264,7 @@ namespace PTor
             {
                 var confirm = MessageBox.Show(this,
                     "Roll back to pre-PTor networking?\n\nStops enforcement, removes the driver service PTor created " +
-                    "(never anyone else's), restores your proxy + env. The in-app blocklist is memory-only and needs no rollback.",
+                    "(never anyone else's), restores your proxy + env.",
                     "Rollback checkpoint", MessageBoxButton.YesNo, MessageBoxImage.Warning);
                 if (confirm != MessageBoxResult.Yes) return;
                 try
@@ -451,81 +444,6 @@ namespace PTor
                 Text = "Ctrl/Shift+click selects multiple. Delete key, right-click → Delete, or double-click removes."
             });
 
-            var adBox = new Border
-            {
-                Background = panelBrush,
-                CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(12),
-                Margin = new Thickness(0, 0, 0, 10)
-            };
-            DockPanel.SetDock(adBox, Dock.Top);
-            root.Children.Add(adBox);
-
-            var ad = new StackPanel();
-            adBox.Child = ad;
-            ad.Children.Add(new TextBlock
-            {
-                Text = "Ad Blocklist (filter-list URLs)",
-                Foreground = textBrush,
-                FontWeight = FontWeights.SemiBold,
-                Margin = new Thickness(0, 0, 0, 6)
-            });
-            _blockFileList = new ListBox
-            {
-                Background = new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20)),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(0x45, 0x45, 0x45)),
-                BorderThickness = new Thickness(1),
-                Foreground = textBrush,
-                Height = 70,
-                SelectionMode = SelectionMode.Extended,
-                ItemsSource = _blockFiles,
-                ContextMenu = DeleteMenu(RemoveSelectedBlockFiles)
-            };
-            _blockFileList.KeyDown += (_, e) =>
-            {
-                if (e.Key == System.Windows.Input.Key.Delete) { RemoveSelectedBlockFiles(); e.Handled = true; }
-            };
-            _blockFileList.MouseDoubleClick += (_, __) => RemoveSelectedBlockFiles();
-            ad.Children.Add(_blockFileList);
-
-            var urlAddRow = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
-            ad.Children.Add(urlAddRow);
-            var urlAddBtn = SafetyBtn("Add URL", panelBrush, textBrush);
-            DockPanel.SetDock(urlAddBtn, Dock.Right);
-            urlAddBtn.Margin = new Thickness(8, 0, 0, 0);
-            urlAddBtn.Click += (_, __) => AddBlocklistUrl();
-            urlAddRow.Children.Add(urlAddBtn);
-            _blockUrlInput = DialogTextBox("https://…/list.txt", textBrush);
-            _blockUrlInput.KeyDown += (_, e) => { if (e.Key == System.Windows.Input.Key.Enter) AddBlocklistUrl(); };
-            urlAddRow.Children.Add(_blockUrlInput);
-
-            var adBtnRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
-            ad.Children.Add(adBtnRow);
-            var updateBlBtn = SafetyBtn("Update Block List", panelBrush, textBrush);
-            updateBlBtn.Click += async (_, __) => await UpdateBlockListsAsync();
-            adBtnRow.Children.Add(updateBlBtn);
-            var clearBlBtn = SafetyBtn("Clear", panelBrush, textBrush);
-            clearBlBtn.Margin = new Thickness(8, 0, 0, 0);
-            clearBlBtn.Click += async (_, __) => await ClearBlocklistAsync();
-            adBtnRow.Children.Add(clearBlBtn);
-
-            _blocklistStatus = new TextBlock
-            {
-                Foreground = dimBrush,
-                FontSize = 11,
-                TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 6, 0, 0)
-            };
-            ad.Children.Add(_blocklistStatus);
-            ad.Children.Add(new TextBlock
-            {
-                Text = "Filter lists (EasyList-style: ||rules, exceptions, plain hosts) download to a local cache and block inside PTor's own DNS + relays, on boot and on Update. No admin rights, no system files touched — the OS hosts file is never modified. Applies to relayed app traffic and Tor-DNS while PTor runs.",
-                Foreground = dimBrush,
-                FontSize = 11,
-                TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 6, 0, 0)
-            });
-
             var uaBox = new Border
             {
                 Background = panelBrush,
@@ -597,7 +515,6 @@ namespace PTor
 
             RefreshProxyStatus();
             RefreshLinkStatus();
-            _ = RefreshBlocklistStatusAsync();
             RefreshEnforcementStatus();
             RefreshDnsStatus();
             RefreshBridgeStatus();
@@ -681,7 +598,6 @@ namespace PTor
         {
             RefreshProxyStatus();
             RefreshLinkStatus();
-            _ = RefreshBlocklistStatusAsync();
             RefreshEnforcementStatus();
             RefreshDnsStatus();
             RefreshBridgeStatus();
@@ -1069,153 +985,6 @@ namespace PTor
             _status(string.IsNullOrWhiteSpace(_userAgentInput.Text)
                 ? "User-Agent cleared — system default will be sent."
                 : "Custom User-Agent applied to PTor's own requests.");
-        }
-
-        void RemoveSelectedBlockFiles()
-        {
-            var sel = _blockFileList.SelectedItems.Cast<string>().ToList();
-            if (sel.Count == 0) return;
-            foreach (var f in sel)
-            {
-                _blockFiles.Remove(f);
-                _settings.BlocklistUrls.Remove(f);
-                try
-                {
-                    var cache = HostBlocklist.CachePathFor(HostBlocklist.DefaultCacheDir(), f);
-                    if (File.Exists(cache)) File.Delete(cache);
-                }
-                catch { }
-            }
-            _settings.Save();
-            _status($"Removed {sel.Count} blocklist URL(s).");
-            _ = RefreshBlocklistStatusAsync();
-        }
-
-        void AddBlocklistUrl()
-        {
-            var url = (_blockUrlInput.Text ?? "").Trim();
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
-                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-            {
-                MessageBox.Show(this, "Enter a valid http(s) filter-list URL.",
-                    "Ad blocklist", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-            url = uri.ToString();
-            if (!_blockFiles.Contains(url))
-            {
-                _blockFiles.Add(url);
-                _settings.BlocklistUrls.Add(url);
-                _settings.Save();
-                _status("Blocklist URL added — hit Update Block List to download + block in-app.");
-            }
-            _blockUrlInput.Text = string.Empty;
-            _ = RefreshBlocklistStatusAsync();
-        }
-
-        bool _blBusy;
-
-        // File I/O + untrusted-content regex stay off the UI thread.
-        async System.Threading.Tasks.Task RefreshBlocklistStatusAsync()
-        {
-            if (_blBusy) return;
-            _blBusy = true;
-            try
-            {
-                var files = new System.Collections.Generic.List<string>(_blockFiles);
-                _blocklistStatus.Text = await System.Threading.Tasks.Task.Run(() => DescribeBlocklist(files));
-            }
-            catch (Exception ex)
-            {
-                _blocklistStatus.Text = "Status failed: " + ex.Message;
-            }
-            finally { _blBusy = false; }
-        }
-
-        static string DescribeBlocklist(System.Collections.Generic.List<string> urls)
-        {
-            try
-            {
-                var active = HostBlocklist.GetActiveCount();
-                if (urls.Count == 0)
-                {
-                    return active > 0
-                        ? $"No lists configured, but {active} host(s) still blocking in memory — Clear to drop them."
-                        : "No lists. Add filter-list URLs above, then Update Block List.";
-                }
-                string cacheDir;
-                try { cacheDir = HostBlocklist.DefaultCacheDir(); }
-                catch (Exception ex) { return "Status failed: " + ex.Message; }
-                var cached = urls
-                    .Select(u => { try { return HostBlocklist.CachePathFor(cacheDir, u); } catch { return ""; } })
-                    .Where(File.Exists)
-                    .ToList();
-                if (cached.Count == 0)
-                    return $"{urls.Count} URL(s) configured, nothing downloaded yet — hit Update Block List. · {active} blocking in-app";
-                var parsed = HostBlocklist.ParseFiles(cached);
-                var parts = $"{urls.Count} URL(s) · {cached.Count} cached · {parsed.Hosts.Count:N0} hosts parsed";
-                try
-                {
-                    var oldest = cached
-                        .Select(f => { try { return File.GetLastWriteTimeUtc(f); } catch { return DateTime.UtcNow; } })
-                        .Min();
-                    var age = DateTime.UtcNow - oldest;
-                    parts += age.TotalHours < 25
-                        ? " · cache updated today"
-                        : $" · cache {Math.Max(1, (int)age.TotalDays)}d old";
-                }
-                catch { }
-                if (parsed.AllowedExceptions > 0)
-                    parts += $" · {parsed.AllowedExceptions} allow-exceptions";
-                if (parsed.SkippedWildcard > 0)
-                    parts += $" · {parsed.SkippedWildcard} wildcard(s) skipped";
-                if (parsed.SkippedUnsupported > 0)
-                    parts += $" · {parsed.SkippedUnsupported} line(s) skipped";
-                parts += $" · {active} blocking in-app";
-                try
-                {
-                    if (HostBlocklist.HasLegacyHostsSection())
-                        parts += " · legacy hosts section still present (PTor ignores it; manual admin edit only)";
-                }
-                catch { }
-                return parts;
-            }
-            catch (Exception ex)
-            {
-                return "Status failed: " + ex.Message;
-            }
-        }
-
-        async System.Threading.Tasks.Task UpdateBlockListsAsync()
-        {
-            var urls = new System.Collections.Generic.List<string>(_blockFiles);
-            if (urls.Count == 0)
-            {
-                MessageBox.Show(this, "Add at least one filter-list URL first.",
-                    "Ad blocklist", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-            _status("Updating blocklists (download, in-app — no admin needed)...");
-            var (ok, message) = await HostBlocklist.UpdateFromUrlsAsync(urls);
-            _status(message);
-            await RefreshBlocklistStatusAsync();
-            if (!ok)
-                MessageBox.Show(this, message, "Ad blocklist", MessageBoxButton.OK, MessageBoxImage.Warning);
-        }
-
-        async System.Threading.Tasks.Task ClearBlocklistAsync()
-        {
-            var confirm = MessageBox.Show(this,
-                "Clear the in-memory blocklist? (Your list URLs and caches are kept.)",
-                "Clear ad blocklist", MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (confirm != MessageBoxResult.Yes) return;
-
-            _status("Clearing in-app blocklist...");
-            var (ok, message) = await HostBlocklist.ClearAsync();
-            _status(message);
-            await RefreshBlocklistStatusAsync();
-            MessageBox.Show(this, message, "Ad blocklist",
-                MessageBoxButton.OK, ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
         }
 
         void RefreshLinkStatus()

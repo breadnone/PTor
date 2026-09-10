@@ -109,20 +109,6 @@ namespace PTor
             try { _engine.HeaderSpoof = _settings.HeaderSpoof ?? ""; } catch { }
             var uaErr = ApplyUserAgent(_settings.UserAgent ?? "");
             if (uaErr != null) AppendStatusLine(uaErr);
-            if (_settings.BlocklistUrls == null) _settings.BlocklistUrls = new List<string>();
-            {
-                var oldVersion = _settings.BlocklistDefaultsVersion;
-                var (merged, version, added) = HostBlocklist.EnsureDefaults(
-                    _settings.BlocklistUrls, oldVersion);
-                _settings.BlocklistUrls = merged;
-                _settings.BlocklistDefaultsVersion = version;
-                if (added.Count > 0 || version != oldVersion)
-                {
-                    try { _settings.Save(); } catch { }
-                    foreach (var a in added)
-                        AppendStatusLine("New default blocklist added: " + a);
-                }
-            }
 
             BuildMainAppRows();
             _appMonitorTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
@@ -145,10 +131,24 @@ namespace PTor
 
             Loaded += async (_, __) =>
             {
-                _ = BootBlocklistsAsync();
+                RemoveLegacyBlocklistCache();
                 _ = BootDivertAuditAsync();
                 if (_torToggle.IsOn) await StartTor();
             };
+        }
+
+        // One-time cleanup: the filter-list feature is gone; drop its
+        // leftover download cache (%AppData%\PTor\blocklists) if a previous
+        // version left it behind.
+        static void RemoveLegacyBlocklistCache()
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PTor", "blocklists");
+                if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir, recursive: true);
+            }
+            catch { }
         }
 
         // Every boot: verify WinDivert driver state (single service, ours vs
@@ -165,51 +165,6 @@ namespace PTor
             catch (Exception ex)
             {
                 AppendStatusLine("WinDivert check failed (no changes made): " + ex.Message);
-            }
-        }
-
-        bool _blockBooting;
-
-        // First-thing-at-boot: load cached filter lists into the in-memory
-        // blocklist, then refresh caches in the background. Purely in-app:
-        // no admin rights, no UAC prompts, OS hosts file never touched.
-        async System.Threading.Tasks.Task BootBlocklistsAsync()
-        {
-            if (_blockBooting) return;
-            _blockBooting = true;
-            try
-            {
-                List<string> urls;
-                try { urls = new List<string>(_settings.BlocklistUrls ?? new List<string>()); }
-                catch { return; }
-                if (urls.Count == 0) return;
-                try
-                {
-                    var (hosts, _) = await System.Threading.Tasks.Task.Run(
-                        () => HostBlocklist.LoadCachedIntoStore(urls));
-                    if (hosts > 0)
-                        AppendStatusLine($"Ad blocklists (in-app): {hosts:N0} host(s) loaded from cache.");
-                }
-                catch { }
-                try
-                {
-                    var (ok, message) = await HostBlocklist.UpdateFromUrlsAsync(urls);
-                    AppendStatusLine((ok ? "Ad blocklists ready (in-app): " : "Ad blocklists: ") + message);
-                }
-                catch (Exception ex)
-                {
-                    AppendStatusLine("Ad blocklists boot update failed: " + ex.Message);
-                }
-                try
-                {
-                    if (HostBlocklist.HasLegacyHostsSection())
-                        AppendStatusLine("Note: a PTor section from an older version is still in the OS hosts file — PTor no longer uses it. Remove those lines manually (admin editor) if you want it gone; PTor will not touch that file.");
-                }
-                catch { }
-            }
-            finally
-            {
-                _blockBooting = false;
             }
         }
 
@@ -1233,14 +1188,13 @@ namespace PTor
                 if (!string.IsNullOrEmpty(spoofedHost)) extra += $" (Host:{TruncateStatus(spoofedHost)})";
                 if (!string.IsNullOrEmpty(sni) && !sni.Equals(host, StringComparison.OrdinalIgnoreCase))
                     extra += $" (SNI:{TruncateStatus(sni)})";
-                var blocked = string.Equals(mode, "BLOCKED", StringComparison.OrdinalIgnoreCase);
                 _log.Add(new RequestLogEntry
                 {
                     Time = DateTime.Now.ToString("HH:mm:ss"),
-                    Method = blocked ? "BLOCKED" : mode,
+                    Method = mode,
                     Host = host,
-                    Route = blocked ? "Blocked" : "Relay",
-                    Status = blocked ? "Blocked (adlist)" : "→ Tor" + extra
+                    Route = "Relay",
+                    Status = "→ Tor" + extra
                 });
                 TrimLog();
             }));
@@ -1807,9 +1761,8 @@ namespace PTor
 
         bool IsBlocked(string host)
         {
-            // In-app ad/track blocklist first (memory-only, never the OS hosts file).
-            try { if (AdBlockStore.Instance.IsBlocked(host)) return true; } catch { }
-            // UI thread mutates this collection while pool threads read: snapshot. One slip max per edit.
+            // Manual user blocklist: the UI thread mutates this collection
+            // while pool threads read, so snapshot. One slip max per edit.
             string[] snapshot;
             try { snapshot = new System.Collections.Generic.List<string>(_blockedDomains).ToArray(); }
             catch (InvalidOperationException) { return false; }

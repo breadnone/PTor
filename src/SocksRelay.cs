@@ -225,16 +225,6 @@ namespace PTor
                     if (!await TryReadExactAsync(stream, pb, hs)) return;
                     var port = (pb[0] << 8) | pb[1];
 
-                    // In-app blocklist: refuse locally, never open upstream.
-                    if (!System.Net.IPAddress.TryParse(host, out _) && AdBlockStore.Instance.IsBlocked(host))
-                    {
-                        try { await stream.WriteAsync(new byte[] { 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, hs); }
-                        catch { }
-                        try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "BLOCKED" }); }
-                        catch { }
-                        return;
-                    }
-
                     var upstream = await SocksUpstream.ConnectWithRetryAsync(
                         _upstreamHost, _upstreamPort, host, port,
                         s => SocksConnectAsync(s, host, port, hs), hs);

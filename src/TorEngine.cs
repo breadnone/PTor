@@ -913,7 +913,7 @@ namespace PTor
                 {
                     var dns = _dnsFwd;
                     if (dns != null && EnforcementActive)
-                        return $"DNS: via Tor (127.0.0.1:53 → Tor DNSPort) · {dns.Forwarded:N0} forwarded · {dns.Failed:N0} failed (SERVFAIL, never clearnet) · {dns.Blocked:N0} blocked in-app (no leak).";
+                        return $"DNS: via Tor (127.0.0.1:53 → Tor DNSPort) · {dns.Forwarded:N0} forwarded · {dns.Failed:N0} failed (SERVFAIL, never clearnet) · {dns.Blocked:N0} local-blocked (no leak).";
                     var snap = _dnsMgr.GetSnapshot();
                     if (snap.Managed)
                         return "DNS: resolver swap still marked managed but forwarder is down — toggle lockdown off/on to repair.";
@@ -1159,13 +1159,6 @@ namespace PTor
 
                 try { parts.Append(_dnsMgr.Disable() + " "); }
                 catch (Exception ex) { parts.Append("DNS restore issue: " + ex.Message + " "); }
-
-                try
-                {
-                    // In-app blocklist is memory-only: nothing persists, nothing to clear.
-                    if (AdBlockStore.Instance.Count > 0) parts.Append("In-app blocklist is memory-only and clears on exit. ");
-                }
-                catch { }
 
                 EnforcementCheckpoint.Delete();
                 return "Rollback complete: " + parts.ToString();

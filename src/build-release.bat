@@ -94,11 +94,11 @@ if not exist "Release\v%NEWVER%\Uninstall.exe" (
   exit /b 1
 )
 if not exist "Release\v%NEWVER%\rescue-internet.bat" (
-  echo ERROR: Release\v%NEWVER%\rescue-internet.bat is missing (Content include broken?).
+  echo ERROR: Release\v%NEWVER%\rescue-internet.bat is missing -- Content include broken?
   exit /b 1
 )
 if not exist "Release\v%NEWVER%\README.md" (
-  echo ERROR: Release\v%NEWVER%\README.md is missing (Content include broken?).
+  echo ERROR: Release\v%NEWVER%\README.md is missing -- Content include broken?
   exit /b 1
 )
 for %%F in ("Release\v%NEWVER%\PTor.exe") do echo OK: Release\v%NEWVER%\PTor.exe (%%~zF bytes)

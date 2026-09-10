@@ -9,12 +9,6 @@ namespace PTor
     {
         public string UserAgent { get; set; } = "";
 
-        // List-based blocking now: URLs are downloaded to a local cache on
-        // boot and on demand. (Legacy BlocklistFiles .txt uploads are gone.)
-        public List<string> BlocklistUrls { get; set; } = new List<string>(HostBlocklist.DefaultUrls);
-
-        public int BlocklistDefaultsVersion { get; set; } = HostBlocklist.CurrentDefaultsVersion;
-
         public List<string> BlockedDomains { get; set; } = new List<string>();
 
         public string HeaderSpoof { get; set; } = "";

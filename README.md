@@ -4,8 +4,8 @@ Tor traffic router for Windows, plus an `Uninstall` companion.
 
 Routes this Windows user's apps through Tor via the system proxy and inherited
 env vars, with an optional Tor-only packet lockdown (WinDivert). Single
-instance — only one copy runs at a time. Ad/tracker blocking is enforced
-100% in-app (DNS + relays); the OS `hosts` file is never touched.
+instance — only one copy runs at a time. No filter lists, no hosts-file
+games: only your own manual Blocked Domains list is enforced.
 
 ## Layout
 
