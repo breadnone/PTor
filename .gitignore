@@ -1,0 +1,21 @@
+# Build outputs (any level)
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+[Tt]est[Rr]esult*/
+*.user
+*.suo
+.vs/
+
+# WPF temp projects generated during build
+*_wpftmp.csproj
+
+# Tor runtime state (regenerated on launch; `state` also leaks guard history)
+src/tordata/
+src/tools/data/cached-*
+src/tools/data/lock
+src/tools/data/state
+src/tools/data/cached-certs
+
+# Logs
+*.log
