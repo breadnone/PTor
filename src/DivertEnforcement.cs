@@ -152,14 +152,17 @@ namespace PTor
             _stop = true;
             System.Threading.Interlocked.Increment(ref _generation);
             var h = System.Threading.Interlocked.Exchange(ref _handle, IntPtr.Zero);
-            Thread? thread;
-            lock (_lifeGate) { thread = _thread; _thread = null; }
+            lock (_lifeGate) { _thread = null; }
             if (ValidHandle(h))
             {
-                // Unblock a parked Recv so Join returns promptly.
                 try { DivertNative.Shutdown(h, DivertNative.SHUTDOWN_BOTH); } catch { }
             }
-            try { thread?.Join(5000); } catch { }
+            // No Join: a parked Recv fails immediately on the closed handle
+            // below, and the generation guard makes the stray loop exit
+            // without touching anything. Joining only ever waited on an
+            // already-doomed thread; skipping it keeps stops instant even
+            // against a wedged driver (worst case one ghost thread holding
+            // its own buffers until process death).
             if (ValidHandle(h))
             {
                 try { DivertNative.Close(h); } catch { }

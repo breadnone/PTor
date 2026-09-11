@@ -88,19 +88,6 @@ namespace PTor
             return reply.StartsWith("250");
         }
 
-        public async Task<bool> SignalShutdownAsync()
-        {
-            // Graceful daemon shutdown: tor exits on its own, which the
-            // Exited event observes — the event-driven stop path. False means
-            // "ask failed", and the caller falls back to the bounded kill.
-            try
-            {
-                var reply = await SendCommandAsync("SIGNAL SHUTDOWN");
-                return reply.StartsWith("250");
-            }
-            catch { return false; }
-        }
-
         public async Task<string> GetCountryAsync(string ip)
         {
             try

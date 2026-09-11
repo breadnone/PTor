@@ -376,7 +376,12 @@ Log notice stdout
             catch { return new List<string>(); }
         }
 
-        public async Task StopAsync(bool gracefulShutdownRequested)
+        // Pure kill, no graceful dance: tor tolerates SIGKILL routinely
+        // (consensus/state rebuild on next start; our sentinel covers update
+        // crashes), and every caller here wants it GONE, not asked nicely.
+        // Only the bounded reap-wait remains — an event wait on death, not a
+        // grace sleep — so ports are actually free before a restart rebinds.
+        public async Task StopAsync()
         {
             var proc = _proc;
             if (proc == null) return;
@@ -384,54 +389,11 @@ Log notice stdout
             _disposing = true;
             try
             {
-                // Event-driven stop. When a graceful SHUTDOWN was requested via
-                // control, the Exited handler below fires the moment tor dies:
-                // an already-dead or fast-dying daemon returns instantly with
-                // zero fixed grace sleeps. (CloseMainWindow is gone on purpose:
-                // tor is a console process with no window, so that call was a
-                // placebo burning 3s every stop.) Without a graceful request
-                // nothing will make it exit on its own, so SIGKILL goes out
-                // immediately instead of waiting on nothing.
                 if (!SafeHasExited(proc))
                 {
-                    if (gracefulShutdownRequested)
-                    {
-                        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        EventHandler? onExit = null;
-                        onExit = (_, __) => { try { tcs.TrySetResult(true); } catch { } };
-                        try { proc.Exited += onExit; } catch { }
-                        try
-                        {
-                            // Re-check after subscribing: died in the race window.
-                            if (!SafeHasExited(proc))
-                            {
-                                // Bounded fallback ONLY: a wedged daemon that
-                                // ignores the SHUTDOWN still gets SIGKILLed.
-                                // This timeout is a last resort, not a grace
-                                // period — the event above is the real path.
-                                var exited = await Task.WhenAny(tcs.Task, Task.Delay(8000)) == tcs.Task;
-                                if (!exited)
-                                    ExitTrace.Log("tor stop: no exit event in 8s, killing");
-                                if (!exited || !SafeHasExited(proc))
-                                {
-                                    try { proc.Kill(entireProcessTree: true); } catch { }
-                                    try { await Task.Run(() => proc.WaitForExit(5000)); } catch { }
-                                    ExitTrace.Log("tor stop: kill waited, exited=" + SafeHasExited(proc));
-                                }
-                                else ExitTrace.Log("tor stop: exited gracefully");
-                            }
-                            else ExitTrace.Log("tor stop: already exited");
-                        }
-                        catch (Exception ex) { ExitTrace.Log("tor stop: " + ex.GetType().Name); }
-                        finally { try { proc.Exited -= onExit; } catch { } }
-                    }
-                    else
-                    {
-                        try { proc.Kill(entireProcessTree: true); } catch { }
-                        try { await Task.Run(() => proc.WaitForExit(5000)); } catch { }
-                    }
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                    try { await Task.Run(() => proc.WaitForExit(5000)); } catch { }
                 }
-                else ExitTrace.Log("tor stop: already exited");
             }
             finally
             {

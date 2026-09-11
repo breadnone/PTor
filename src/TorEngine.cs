@@ -226,6 +226,9 @@ namespace PTor
             var notes = new List<string>();
             void Note(string s) { try { notes.Add(s); } catch { } }
             try { _lifetimeCts?.Cancel(); } catch { }
+            // A start holds ES_SYSTEM_REQUIRED while bootstrapping; dying
+            // without clearing it would forbid sleep until reboot.
+            try { PreventSleep(false); } catch { }
             bool gateTaken = false;
             try { gateTaken = _lifecycleGate.Wait(TimeSpan.FromSeconds(2)); } catch { gateTaken = false; }
             try
@@ -246,9 +249,14 @@ namespace PTor
                 catch { }
                 try { _proc.KillTreeNow(); Note("tor killed"); }
                 catch (Exception ex) { Note("tor kill issue: " + ex.Message); }
+                // Prove-it check, not a repair loop: read back everything a
+                // browser needs for direct internet and say it out loud. If
+                // this line ever shows leftovers, the trace names them.
+                try { Note("verify: " + VerifyDirectState()); }
+                catch (Exception ex) { Note("verify failed: " + ex.Message); }
             }
             finally { if (gateTaken) { try { _lifecycleGate.Release(); } catch { } } }
-            return string.Join(" ", notes);
+            return string.Join(" ", notes.ToArray());
         }
 
         void RestoreOnce(List<string> notes)
@@ -283,6 +291,50 @@ namespace PTor
             try { Note(_dnsMgr.Disable()); } catch (Exception ex) { Note("DNS restore issue: " + ex.Message); }
             try { Note(_env.Disable()); } catch (Exception ex) { Note("env restore issue: " + ex.Message); }
             try { Note(_proxy.Disable()); } catch (Exception ex) { Note("proxy restore issue: " + ex.Message); }
+        }
+
+        // Read-only proof that direct internet works again: proxy off and not
+        // ours, no PAC override, no Tor env vars, DNS resolvers not ours.
+        // Pure reads — safe to call anytime, including from the harness.
+        public string VerifyDirectState()
+        {
+            var parts = new List<string>();
+            try
+            {
+                var p = _proxy.GetSnapshot();
+                parts.Add("proxy=" + (p.ManagedByPTor ? "STILL-MANAGED" :
+                    (p.Enabled == 1 ? "on(" + (p.Server ?? "") + ")" : "off")));
+                string? pac = null;
+                try
+                {
+                    using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                        @"Software\Microsoft\Windows\CurrentVersion\Internet Settings", writable: false);
+                    pac = k?.GetValue("AutoConfigURL", null) as string;
+                }
+                catch { }
+                parts.Add("pac=" + (string.IsNullOrEmpty(pac) ? "absent" : "PRESENT(" + pac + ")"));
+            }
+            catch (Exception ex) { parts.Add("proxy-check-failed(" + ex.GetType().Name + ")"); }
+            try
+            {
+                var leftovers = new List<string>();
+                foreach (var name in new[] { "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy" })
+                {
+                    string? v = null;
+                    try { v = Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User); } catch { }
+                    if (!string.IsNullOrEmpty(v) && v.IndexOf("127.0.0.1", StringComparison.OrdinalIgnoreCase) >= 0)
+                        leftovers.Add(name);
+                }
+                parts.Add("tor-env=" + (leftovers.Count == 0 ? "clean" : "LEFTOVER(" + string.Join(",", leftovers) + ")"));
+            }
+            catch (Exception ex) { parts.Add("env-check-failed(" + ex.GetType().Name + ")"); }
+            try
+            {
+                var d = _dnsMgr.GetSnapshot();
+                parts.Add("dns=" + (d.Managed ? "STILL-MANAGED" : "system"));
+            }
+            catch (Exception ex) { parts.Add("dns-check-failed(" + ex.GetType().Name + ")"); }
+            return string.Join(" ", parts.ToArray());
         }
 
         volatile int _stdoutBootstrapped;
@@ -491,7 +543,7 @@ namespace PTor
                 try
                 {
                     // No stale daemon: leftover tor would bootstrap against the previous torrc.
-                    if (_proc.IsRunning) await _proc.StopAsync(false);
+                    if (_proc.IsRunning) await _proc.StopAsync();
                     _proc.Start(single);
                 }
                 catch (OperationCanceledException) { throw; }
@@ -516,14 +568,14 @@ namespace PTor
                 }
                 catch (OperationCanceledException)
                 {
-                    try { await _proc.StopAsync(false); } catch { }
+                    try { await _proc.StopAsync(); } catch { }
                     throw;
                 }
                 catch (Exception ex)
                 {
                     last = ex;
                     _bridgeHealth.RecordResult(line, false);
-                    try { await _proc.StopAsync(false); } catch { }
+                    try { await _proc.StopAsync(); } catch { }
                     LogMessage?.Invoke(this,
                         $"Bridge candidate {BridgeHealthStore.ShortName(line)} failed — trying next.");
                     ThrowIfStopping();
@@ -565,7 +617,7 @@ namespace PTor
                     {
                         LogMessage?.Invoke(this, "Trying direct guards...");
                         var direct = BridgeConfigEngine.Resolve(BridgeConfig.DirectOnly(), PtToolsDir, defaults);
-                        if (_proc.IsRunning) await _proc.StopAsync(false);
+                        if (_proc.IsRunning) await _proc.StopAsync();
                         _proc.Start(null);
                         _lastResolved = direct;
                         StartRelays();
@@ -691,7 +743,7 @@ namespace PTor
                         _reconnecting = false;
                         return;
                     }
-                    await _proc.StopAsync(false);
+                    await _proc.StopAsync();
                     var last = _lastResolved;
                     _proc.Start(last?.UseBridges == true ? last : null);
                 }
@@ -709,7 +761,7 @@ namespace PTor
                 // Stop during bootstrap: shut the new daemon down, swap in nothing.
                 if (_lifetimeCts?.IsCancellationRequested == true)
                 {
-                    try { await _proc.StopAsync(false); } catch { }
+                    try { await _proc.StopAsync(); } catch { }
                     _reconnectAttempt = 0;
                     _reconnecting = false;
                     return;
@@ -1472,41 +1524,13 @@ namespace PTor
 
             var torSw = Stopwatch.StartNew();
             ExitTrace.Log("engine stop: tor stop begin");
-            // Graceful first: ask tor itself to shut down over control. It
-            // then dies on its own, which StopAsync observes via the Exited
-            // event (no fixed waits anywhere on this path). Capped courtesy:
-            // a wedged control must not eat the stop budget — StopAsync's
-            // bounded kill comes next regardless.
-            bool askedNicely = false;
-            try
-            {
-                var control = _control;
-                if (control != null && control.IsConnected)
-                {
-                    var signal = control.SignalShutdownAsync();
-                    var winner = Task.WhenAny(signal, Task.Delay(5000)).GetAwaiter().GetResult();
-                    if (winner == signal)
-                    {
-                        try { askedNicely = signal.GetAwaiter().GetResult(); }
-                        catch { askedNicely = false; }
-                    }
-                    else
-                    {
-                        // Abandoned loser: observe its exception so nothing
-                        // surfaces unobserved on the finalizer thread.
-                        _ = signal.ContinueWith(t => { var _ = t.Exception; },
-                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
-                    }
-                }
-            }
-            catch { askedNicely = false; }
-            ExitTrace.Log("engine stop: graceful " + (askedNicely ? "accepted" : "skipped/failed"));
+            // Pure kill (no graceful dance): tor tolerates SIGKILL routinely.
             try { _control?.Dispose(); } catch { }
             _control = null;
 
             try { _bridge.Dispose(); } catch { }
             try { _socksRelay.Dispose(); } catch { }
-            try { _proc.StopAsync(askedNicely).GetAwaiter().GetResult(); }
+            try { _proc.StopAsync().GetAwaiter().GetResult(); }
             catch (Exception ex) { ExitTrace.Log("engine stop: tor stop threw " + ex.GetType().Name); }
             ExitTrace.Log("engine stop: tor stop done in " + torSw.ElapsedMilliseconds + "ms");
 
