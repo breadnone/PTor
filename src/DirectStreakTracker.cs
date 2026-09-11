@@ -8,6 +8,11 @@ namespace PTor
     {
         readonly Dictionary<int, int> _streak = new();
 
+        public void Clear()
+        {
+            try { _streak.Clear(); } catch { }
+        }
+
         public List<int> Update(IEnumerable<(int pid, bool direct)> rows, int threshold = 5)
         {
             var newly = new List<int>();

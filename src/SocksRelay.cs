@@ -28,6 +28,9 @@ namespace PTor
                 catch { Drop(tcp); return null; }
 
             // 4 attempts over ~6s; rotations need 5-20s to rebuild circuits.
+            // Deliberate backoff, not polling: right after a rotation there is
+            // no event for "fresh circuits ready" (Tor builds them lazily),
+            // so we back off while the data path rebuilds. Cancellation-aware.
             for (var attempt = 1; attempt <= 4; attempt++)
             {
                 if (attempt > 1)

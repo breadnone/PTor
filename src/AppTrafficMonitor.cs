@@ -323,27 +323,5 @@ namespace PTor
             }
             finally { Marshal.FreeHGlobal(buf); }
         }
-
-        static readonly Dictionary<int, string> _pathCache = new();
-        static readonly object _cacheGate = new();
-
-        public static void PruneCache(HashSet<int> livePids)
-        {
-            try
-            {
-                lock (_cacheGate)
-                {
-                    if (_pathCache.Count == 0) return;
-                    var dead = new List<int>();
-                    foreach (var pid in _pathCache.Keys)
-                    {
-                        if (livePids.Contains(pid)) continue;
-                        if (!RunningAppEnumerator.IsPidAlive(pid)) dead.Add(pid);
-                    }
-                    foreach (var pid in dead) _pathCache.Remove(pid);
-                }
-            }
-            catch { }
-        }
     }
 }

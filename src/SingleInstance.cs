@@ -56,21 +56,25 @@ namespace PTor
             return 0;
         }
 
-        // Waits for a PID to exit (poll, bounded). True when it is gone —
-        // including "never existed". Never throws.
+        // Waits for a PID to exit (bounded). Event-driven via
+        // WaitForExitAsync: no polling quanta, returns the moment the
+        // process dies or the timeout lapses. Never throws.
         public static bool WaitForPidExit(int pid, TimeSpan timeout)
         {
             if (pid <= 0) return true;
             try
             {
-                var sw = Stopwatch.StartNew();
-                while (sw.Elapsed < timeout)
+                using var p = Process.GetProcessById(pid);
+                using var cts = new CancellationTokenSource(timeout);
+                try
                 {
-                    if (IsPidGone(pid)) return true;
-                    Thread.Sleep(250);
+                    p.WaitForExitAsync(cts.Token).GetAwaiter().GetResult();
+                    return true;
                 }
-                return IsPidGone(pid);
+                catch (OperationCanceledException) { return IsPidGone(pid); }
             }
+            catch (ArgumentException) { return true; } // no such PID
+            catch (InvalidOperationException) { return true; } // already gone
             catch { return false; }
         }
 

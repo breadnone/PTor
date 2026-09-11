@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
@@ -28,6 +29,9 @@ namespace PTor
         TextBox _userAgentInput;
         TextBlock _enforceStatus;
         TextBlock _dnsStatus;
+        TextBlock _browserStatus;
+        TextBox _torLogBox;
+        bool _browserBusy;
         ComboBox _bridgeModeBox = null!;
         TextBox _bridgeCustomInput = null!;
         TextBlock _bridgeStatus = null!;
@@ -489,6 +493,78 @@ namespace PTor
                 Margin = new Thickness(0, 6, 0, 0)
             });
 
+            var browserBox = new Border
+            {
+                Background = panelBrush,
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12),
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            DockPanel.SetDock(browserBox, Dock.Top);
+            root.Children.Add(browserBox);
+
+            var browserStack = new StackPanel();
+            browserBox.Child = browserStack;
+            browserStack.Children.Add(new TextBlock
+            {
+                Text = "Browser checklist (Secure DNS)",
+                Foreground = textBrush,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+            _browserStatus = new TextBlock
+            {
+                Foreground = dimBrush,
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap
+            };
+            browserStack.Children.Add(_browserStatus);
+            browserStack.Children.Add(new TextBlock
+            {
+                Text = "Read-only: Secure DNS (DoH) bypasses Tor DNS, and breaks page loads under Tor-only lockdown. " +
+                       "If a browser fails while others work, turn its Secure DNS off (Firefox: Settings → Privacy → DNS over HTTPS → Off; " +
+                       "Edge/Chrome: Settings → Privacy → Security → Use secure DNS → Off or automatic with fallback).",
+                Foreground = dimBrush,
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 0)
+            });
+
+            var torLogBox = new Border
+            {
+                Background = panelBrush,
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12),
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            DockPanel.SetDock(torLogBox, Dock.Top);
+            root.Children.Add(torLogBox);
+
+            var torLogStack = new StackPanel();
+            torLogBox.Child = torLogStack;
+            torLogStack.Children.Add(new TextBlock
+            {
+                Text = "Tor log (recent lines — says WHY tor won't connect)",
+                Foreground = textBrush,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+            _torLogBox = new TextBox
+            {
+                Background = new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20)),
+                Foreground = textBrush,
+                BorderBrush = new SolidColorBrush(Color.FromRgb(0x45, 0x45, 0x45)),
+                BorderThickness = new Thickness(1),
+                FontFamily = new FontFamily("Consolas, Cascadia Mono"),
+                FontSize = 11,
+                Height = 130,
+                AcceptsReturn = true,
+                IsReadOnly = true,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+            };
+            torLogStack.Children.Add(_torLogBox);
+
             var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
             DockPanel.SetDock(btnRow, Dock.Top);
             root.Children.Add(btnRow);
@@ -519,6 +595,8 @@ namespace PTor
             RefreshDnsStatus();
             RefreshBridgeStatus();
             RefreshPathStatus();
+            RefreshTorLog();
+            _ = RefreshBrowserStatusAsync();
         }
 
         static (string Label, string Value)[] UserAgentPresets => new[]
@@ -602,6 +680,8 @@ namespace PTor
             RefreshDnsStatus();
             RefreshBridgeStatus();
             RefreshPathStatus();
+            RefreshTorLog();
+            _ = RefreshBrowserStatusAsync();
             if (!_enforceBusy)
             {
                 _enforceBusy = true;
@@ -793,6 +873,53 @@ namespace PTor
                 _bridgeStatus.Text = text;
             }
             catch { _bridgeStatus.Text = "Bridges: unknown."; }
+        }
+
+        void RefreshTorLog()
+        {
+            try
+            {
+                List<string> lines;
+                try { lines = _engine.GetTorLogTail() ?? new List<string>(); }
+                catch { lines = new List<string>(); }
+                _torLogBox.Text = lines.Count == 0
+                    ? ( torRunningHint() )
+                    : string.Join(Environment.NewLine, lines);
+                try { _torLogBox.ScrollToEnd(); } catch { }
+            }
+            catch { try { _torLogBox.Text = "Log unavailable."; } catch { } }
+
+            string torRunningHint()
+            {
+                try { return _engine.IsTorRunning ? "(tor running, no log lines captured yet)" : "(tor not running — start routing to capture its log)"; }
+                catch { return "(tor log unavailable)"; }
+            }
+        }
+
+        // File reads + JSON stay off the UI thread.
+        async System.Threading.Tasks.Task RefreshBrowserStatusAsync()
+        {
+            if (_browserBusy) return;
+            _browserBusy = true;
+            try
+            {
+                var notes = await System.Threading.Tasks.Task.Run(() => BrowserDnsCheck.Run());
+                var parts = new List<string>();
+                var bad = 0;
+                foreach (var n in notes)
+                {
+                    parts.Add((n.Bad ? "✕ " : "✓ ") + n.Browser + ": " + n.Detail);
+                    if (n.Bad) bad++;
+                }
+                _browserStatus.Text = string.Join(Environment.NewLine, parts);
+                if (bad > 0)
+                    _status($"Browser checklist: {bad} Secure-DNS issue(s) — see Config. Likely why some browsers fail while others work.");
+            }
+            catch (Exception ex)
+            {
+                _browserStatus.Text = "Checklist failed: " + ex.Message;
+            }
+            finally { _browserBusy = false; }
         }
 
         void RefreshDnsStatus()

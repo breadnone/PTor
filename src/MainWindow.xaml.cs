@@ -644,19 +644,27 @@ namespace PTor
         {
             try
             {
-                if (!_engine.RoutingActive || _engine.RoutingStartedUtc == null)
+                // Single snapshot: RoutingActive is flipped on a pool thread
+                // during stop, so read both once and decide off that (a torn
+                // read here can only fail safe to "no confirm").
+                var routingSince = _engine.RoutingStartedUtc;
+                if (!_engine.RoutingActive || routingSince == null)
                     return (true, 0);
-                var since = _engine.RoutingStartedUtc.Value;
                 var (shown, total) = await System.Threading.Tasks.Task.Run(
-                    () => RunningAppEnumerator.GetLaunchedSince(since));
+                    () => RunningAppEnumerator.GetLaunchedSince(routingSince.Value));
                 if (total == 0)
                     return (true, 0);
                 var names = string.Join("\n", shown.Select(s => "  • " + s))
                     + (total > shown.Count ? $"\n  • …and {total - shown.Count} more" : "");
-                var answer = MessageBox.Show(this,
-                    $"{total} app(s) were launched while routing was on and keep Tor proxy env until restarted:\n{names}\n\n" +
-                    $"They will go OFFLINE until you restart them. {actionNoun} anyway?",
-                    "Apps will go offline", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                var text = $"{total} app(s) were launched while routing was on and keep Tor proxy env until restarted:\n{names}\n\n" +
+                    $"They will go OFFLINE until you restart them. {actionNoun} anyway?";
+                // Owner only when actually visible: a modal dialog parented to
+                // a hidden window waits for an answer nobody can see (freeze).
+                var visible = false;
+                try { visible = IsVisible; } catch { }
+                var answer = visible
+                    ? MessageBox.Show(this, text, "Apps will go offline", MessageBoxButton.YesNo, MessageBoxImage.Warning)
+                    : MessageBox.Show(text, "Apps will go offline", MessageBoxButton.YesNo, MessageBoxImage.Warning);
                 return (answer == MessageBoxResult.Yes, total);
             }
             catch { return (true, 0); }
@@ -810,7 +818,9 @@ namespace PTor
                 try { _appMonitorTimer?.Start(); } catch { }
                 return;
             }
+            ExitTrace.Log("restart teardown (relaunch)");
             _reallyClose = true;
+            ArmExitFailsafe("restart");
             try { _trayIcon.Dispose(); } catch { }
             try { _client.Dispose(); } catch { }
             Close();
@@ -845,7 +855,9 @@ namespace PTor
                 try { _appMonitorTimer?.Start(); } catch { }
                 return;
             }
+            ExitTrace.Log("restart teardown (elevated relaunch)");
             _reallyClose = true;
+            ArmExitFailsafe("elevated restart");
             try { _trayIcon.Dispose(); } catch { }
             try { _client.Dispose(); } catch { }
             Close();
@@ -1009,7 +1021,15 @@ namespace PTor
 
         void MainAppMonitorTick()
         {
-            if (_appBusy || !IsVisible) return;
+            if (_appBusy) return;
+            if (!IsVisible)
+            {
+                // Hidden in tray: no sampling, but never retain rows or
+                // streaks for processes that died while we weren't looking.
+                try { DropDeadRows(); } catch { }
+                try { _streakTracker.Clear(); } catch { }
+                return;
+            }
             _appBusy = true;
             _ = MainAppMonitorTickAsync();
             if (++_watchTick % 15 == 0) _ = WatchdogTickAsync();
@@ -1038,13 +1058,25 @@ namespace PTor
             try
             {
                 _appTick++;
-                if (_appTick % 5 == 0) MergeMainAppRows();
+                // Process-table walks (every PID + exe path) can stall on
+                // wedged drives/shares: enumerate on pool, merge on UI.
+                if (_appTick % 5 == 0)
+                {
+                    Dictionary<int, RunningAppInfo>? current = null;
+                    try
+                    {
+                        current = await System.Threading.Tasks.Task.Run(
+                            () => RunningAppEnumerator.GetNonSystemUserApps()
+                                .ToDictionary(a => a.Pid));
+                    }
+                    catch { }
+                    if (current != null) MergeMainAppRows(current);
+                    else DropDeadRows();
+                }
                 else DropDeadRows();
                 // Table walk off-UI (grows with socket counts); rows update back on UI context.
                 var traffic = await System.Threading.Tasks.Task.Run(
                     () => AppTrafficMonitor.Snapshot(_engine.SocksPort, _engine.BridgePort));
-                await System.Threading.Tasks.Task.Run(
-                    () => AppTrafficMonitor.PruneCache(new HashSet<int>(traffic.Keys)));
                 foreach (var row in _appRows)
                 {
                     traffic.TryGetValue(row.Pid, out var stats);
@@ -1070,21 +1102,29 @@ namespace PTor
 
         void BuildMainAppRows()
         {
-            try
+            // One-time population, same off-UI rule (first paint wins over rows).
+            _ = System.Threading.Tasks.Task.Run(() =>
             {
-                _appRows.Clear();
-                foreach (var a in RunningAppEnumerator.GetNonSystemUserApps())
-                    _appRows.Add(new MonitoredApp(a.Pid, a.Name, a.ExePath));
-            }
-            catch { }
+                List<RunningAppInfo> list;
+                try { list = RunningAppEnumerator.GetNonSystemUserApps(); }
+                catch { return; }
+                SafeBeginInvoke(() =>
+                {
+                    try
+                    {
+                        _appRows.Clear();
+                        foreach (var a in list)
+                            _appRows.Add(new MonitoredApp(a.Pid, a.Name, a.ExePath));
+                    }
+                    catch { }
+                });
+            });
         }
 
-        void MergeMainAppRows()
+        void MergeMainAppRows(Dictionary<int, RunningAppInfo> current)
         {
             try
             {
-                var current = RunningAppEnumerator.GetNonSystemUserApps()
-                    .ToDictionary(a => a.Pid);
                 for (var i = _appRows.Count - 1; i >= 0; i--)
                 {
                     var row = _appRows[i];
@@ -1305,76 +1345,127 @@ namespace PTor
             if (_shuttingDown) return;
             if (_updating)
             {
-                MessageBox.Show(this,
+                var updateText =
                     "A Tor bundle update is installing right now — quitting mid-install can leave it half-written. " +
-                    "Wait for it to finish (interrupting is safe: leftovers self-heal on next start).",
-                    "Update in progress", MessageBoxButton.OK, MessageBoxImage.Information);
+                    "Wait for it to finish (interrupting is safe: leftovers self-heal on next start).";
+                // Same hidden-owner rule as the quit confirm: never stack an
+                // invisible modal (each tray Exit click would pile another).
+                var updateVisible = false;
+                try { updateVisible = IsVisible; } catch { }
+                if (updateVisible)
+                    MessageBox.Show(this, updateText, "Update in progress", MessageBoxButton.OK, MessageBoxImage.Information);
+                else
+                    MessageBox.Show(updateText, "Update in progress", MessageBoxButton.OK, MessageBoxImage.Information);
+                ExitTrace.Log("exit refused: update in progress");
                 return;
             }
             _shuttingDown = true;
-
-            // The window is usually still hidden in the tray when Exit comes
-            // from the tray menu: bring it forward FIRST so the confirm
-            // dialog below and the shutdown progress are actually visible.
-            // (A modal dialog owned by a hidden window looks exactly like a
-            // freeze: the app waits for an answer the user cannot see.)
-            var wasHidden = false;
+            ExitTrace.Log("exit begin (tray)");
             try
             {
-                wasHidden = !IsVisible;
-                Show();
-                WindowState = WindowState.Normal;
-                ShowInTaskbar = true;
-                Activate();
-            }
-            catch { }
-
-            if (_engine.RoutingActive)
-            {
-                var (proceed, affected) = await ConfirmStopRoutingAsync("Quit PTor");
-                if (!proceed)
+                // The window is usually still hidden in the tray when Exit comes
+                // from the tray menu: bring it forward FIRST so the confirm
+                // dialog below and the shutdown progress are actually visible.
+                // (A modal dialog owned by a hidden window looks exactly like a
+                // freeze: the app waits for an answer the user cannot see.)
+                var wasHidden = false;
+                try
                 {
-                    _shuttingDown = false;
-                    AppendStatusLine("Quit cancelled — routing still on.");
-                    try
-                    {
-                        if (wasHidden)
-                        {
-                            Hide();
-                            _trayIcon.Show();
-                        }
-                    }
-                    catch { }
-                    return;
+                    wasHidden = !IsVisible;
+                    Show();
+                    WindowState = WindowState.Normal;
+                    ShowInTaskbar = true;
+                    Activate();
+                    ExitTrace.Log("exit window restored wasHidden=" + wasHidden);
                 }
-                if (affected > 0)
-                    AppendStatusLine($"Quitting — remember to restart the {affected} listed app(s).");
-            }
+                catch (Exception ex) { ExitTrace.Log("exit restore failed: " + ex.GetType().Name); }
 
-            AppendStatusLine("Shutting down Tor...");
-            SetBusy(true, "Shutting down…");
-            try { _appMonitorTimer?.Stop(); } catch { }
-            try
-            {
-                // Never let a wedged stop hang the exit: bound the wait, then
-                // continue to teardown regardless (StopAsync's verification
-                // pass already best-effort repaired proxy/env/DNS).
-                await System.Threading.Tasks.Task.Run(() => _engine.StopAsync())
-                    .WaitAsync(TimeSpan.FromSeconds(25));
+                if (_engine.RoutingActive)
+                {
+                    var (proceed, affected) = await ConfirmStopRoutingAsync("Quit PTor");
+                    ExitTrace.Log("exit confirm proceed=" + proceed + " affected=" + affected);
+                    if (!proceed)
+                    {
+                        _shuttingDown = false;
+                        AppendStatusLine("Quit cancelled — routing still on.");
+                        try
+                        {
+                            if (wasHidden)
+                            {
+                                Hide();
+                                _trayIcon.Show();
+                            }
+                        }
+                        catch { }
+                        ExitTrace.Log("exit cancelled by user");
+                        return;
+                    }
+                    if (affected > 0)
+                        AppendStatusLine($"Quitting — remember to restart the {affected} listed app(s).");
+                }
+
+                AppendStatusLine("Shutting down Tor...");
+                SetBusy(true, "Shutting down…");
+                try { _appMonitorTimer?.Stop(); } catch { }
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    // Never let a wedged stop hang the exit: bound the wait, then
+                    // continue to teardown regardless (StopAsync's verification
+                    // pass already best-effort repaired proxy/env/DNS).
+                    await System.Threading.Tasks.Task.Run(() => _engine.StopAsync())
+                        .WaitAsync(TimeSpan.FromSeconds(25));
+                    ExitTrace.Log("exit engine stop done in " + sw.ElapsedMilliseconds + "ms");
+                }
+                catch (Exception ex)
+                {
+                    ExitTrace.Log("exit engine stop issue after " + sw.ElapsedMilliseconds + "ms: " + ex.GetType().Name);
+                    AppendStatusLine("Shutdown stop issue (continuing to exit): " + ex.GetType().Name);
+                }
             }
             catch (Exception ex)
             {
-                AppendStatusLine("Shutdown stop issue (continuing to exit): " + ex.GetType().Name);
+                // Any unexpected failure above must STILL tear down below: a
+                // latched _shuttingDown on a live app was the un-exitable state.
+                ExitTrace.Log("exit UNEXPECTED, forcing teardown: " + ex.GetType().Name + " " + ex.Message);
             }
             finally
             {
-                // Guaranteed exit: no throw in here may prevent shutdown.
+                ExitTrace.Log("exit teardown begin");
                 _reallyClose = true;
-                try { _trayIcon.Dispose(); } catch { }
-                try { _client.Dispose(); } catch { }
-                try { Close(); } catch { }
-                try { Application.Current.Shutdown(); } catch { }
+                ArmExitFailsafe("tray exit");
+                try { _trayIcon.Dispose(); ExitTrace.Log("exit tray disposed"); }
+                catch (Exception ex) { ExitTrace.Log("exit tray dispose: " + ex.GetType().Name); }
+                try { _client.Dispose(); }
+                catch (Exception ex) { ExitTrace.Log("exit client dispose: " + ex.GetType().Name); }
+                try { Close(); ExitTrace.Log("exit Close returned"); }
+                catch (Exception ex) { ExitTrace.Log("exit Close threw: " + ex.GetType().Name); }
+                try { Application.Current.Shutdown(); ExitTrace.Log("exit Shutdown returned"); }
+                catch (Exception ex) { ExitTrace.Log("exit Shutdown threw: " + ex.GetType().Name); }
             }
+        }
+
+        // Last resort, armed once teardown starts: if anything below hangs
+        // (Close/Shutdown included), the process force-exits at 90s instead
+        // of sticking forever. Normal exits finish in seconds, so this can
+        // only fire when truly stuck. Background pool thread: evaporates with
+        // a clean exit, never delays one.
+        static void ArmExitFailsafe(string why)
+        {
+            try
+            {
+                _ = System.Threading.Tasks.Task.Run(async () =>
+                {
+                    try
+                    {
+                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(90));
+                        try { ExitTrace.Log("FAILSAFE fired 90s after " + why + " — forcing process exit."); } catch { }
+                        try { Environment.Exit(42); } catch { }
+                    }
+                    catch { }
+                });
+            }
+            catch { }
         }
     }
 

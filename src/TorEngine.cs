@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -129,7 +130,15 @@ namespace PTor
             DnsPort = dnsPort;
 
             _proc = new TorProcessManager(appDir, socksPort, controlPort, dnsPort);
-            _proc.StateChanged += (_, e) => StateChanged?.Invoke(this, e);
+            _proc.StateChanged += (_, e) =>
+            {
+                // tor's stdout ALSO announces bootstrap % ("Bootstrapped
+                // 100%"): capture it so the readiness gate can complete on
+                // whichever signal arrives first (stdout event or control
+                // poll) instead of polling alone.
+                try { if ((e.BootstrapPercent ?? -1) >= 100) Volatile.Write(ref _stdoutBootstrapped, 1); } catch { }
+                try { StateChanged?.Invoke(this, e); } catch { }
+            };
             _proc.UnexpectedExit += async (_, __) => await HandleUnexpectedExit();
 
             _bridge = new HttpToSocksBridge("127.0.0.1", socksPort, bridgePort);
@@ -183,10 +192,14 @@ namespace PTor
             // bootstrap (bridge tiers!) observes this while we wait and
             // aborts, instead of Stop hanging behind it indefinitely.
             try { _lifetimeCts?.Cancel(); } catch { }
+            var gateSw = Stopwatch.StartNew();
+            ExitTrace.Log("engine stop: waiting gate");
             await _lifecycleGate.WaitAsync();
+            ExitTrace.Log("engine stop: gate acquired in " + gateSw.ElapsedMilliseconds + "ms");
             try
             {
                 await StopCoreAsync();
+                ExitTrace.Log("engine stop: core done");
             }
             finally
             {
@@ -194,9 +207,17 @@ namespace PTor
             }
         }
 
+        volatile int _stdoutBootstrapped;
+        // Run generation: bumped on every start AND every stop. A reconnect
+        // sleeping through either wakes up stale and must stand down, even
+        // if it captured a fresh CTS (late-duplicate crash event).
+        volatile int _runSeq;
+
         async Task StartCoreAsync(int rotateEverySec)
         {
             _lifetimeCts = new CancellationTokenSource();
+            Interlocked.Increment(ref _runSeq);
+            Volatile.Write(ref _stdoutBootstrapped, 0);
             PreventSleep(true);
             try
             {
@@ -233,6 +254,9 @@ namespace PTor
                 _lastResolved = direct;
                 StartRelays();
                 await WaitForBootstrapAndConnectControl(40);
+                // Control-port auth is NOT readiness (the port opens in the
+                // first seconds of life): only flip routing on at 100%.
+                await WaitForBootstrapCompleteAsync(180, "direct guards");
             }
             else if (_bridges.Mode == BridgeMode.Auto)
             {
@@ -321,6 +345,59 @@ namespace PTor
             return 80;
         }
 
+        // Bootstrap takes far longer than control-connect on slow transports.
+        internal static int BootstrapTimeoutForLine(string? line)
+        {
+            try
+            {
+                if (string.Equals(BridgeConfigEngine.TransportOfLine(line ?? ""),
+                        "snowflake", StringComparison.OrdinalIgnoreCase))
+                    return 420;
+            }
+            catch { }
+            return line == null ? 180 : 300;
+        }
+
+        // Hard readiness gate: control-port auth only proves tor is ALIVE.
+        // Flipping routing on before bootstrap 100% sends every app (and the
+        // link checks) into cold circuits that time out — the classic
+        // "bootstrapped, but nothing routes until I toggle" report. Polls
+        // GETINFO status/bootstrap-phase; a stalled bootstrap fails the start
+        // loudly instead of stranding routing on a dead Tor.
+        async Task WaitForBootstrapCompleteAsync(int timeoutSec, string what)
+        {
+            var sw = Stopwatch.StartNew();
+            var lastPct = -1;
+            while (sw.Elapsed.TotalSeconds < timeoutSec)
+            {
+                if (_lifetimeCts?.IsCancellationRequested == true)
+                    throw new OperationCanceledException("Stop requested during bootstrap.");
+                int pct = -1;
+                try { if (_control != null) pct = await _control.GetBootstrapPercentAsync(); }
+                catch { }
+                // Either signal completes the gate: stdout event or control poll.
+                if (Volatile.Read(ref _stdoutBootstrapped) == 1 || pct >= 100)
+                {
+                    LogMessage?.Invoke(this, "Tor bootstrap complete (100%) — data path is live.");
+                    return;
+                }
+                if (pct != lastPct && pct >= 0)
+                {
+                    lastPct = pct;
+                    StateChanged?.Invoke(this, new TorStateChangedEventArgs
+                    {
+                        State = TorState.Bootstrapping,
+                        Message = $"Tor bootstrapping ({pct}%)",
+                        BootstrapPercent = pct
+                    });
+                }
+                await Task.Delay(1000);
+            }
+            throw new TimeoutException(
+                $"Tor stalled during bootstrap{(lastPct >= 0 ? $" at {lastPct}%" : "")} via {what} — " +
+                "no usable path yet. Routing stays OFF (toggle to retry; Snowflake on slow links can need several minutes).");
+        }
+
         // One candidate per attempt (best-ranked first); health persists, so steady state burns one bridge per start.
         async Task StartWithBridgeFallbackAsync(ResolvedBridges resolved)
         {
@@ -336,7 +413,7 @@ namespace PTor
                 try
                 {
                     // No stale daemon: leftover tor would bootstrap against the previous torrc.
-                    if (_proc.IsRunning) await _proc.StopAsync();
+                    if (_proc.IsRunning) await _proc.StopAsync(false);
                     _proc.Start(single);
                 }
                 catch (OperationCanceledException) { throw; }
@@ -351,6 +428,8 @@ namespace PTor
                 try
                 {
                     await WaitForBootstrapAndConnectControl(AttemptsForLine(line));
+                    await WaitForBootstrapCompleteAsync(BootstrapTimeoutForLine(line),
+                        BridgeHealthStore.ShortName(line));
                     _bridgeHealth.RecordResult(line, true);
                     _lastResolved = single;
                     LogMessage?.Invoke(this,
@@ -359,14 +438,14 @@ namespace PTor
                 }
                 catch (OperationCanceledException)
                 {
-                    try { await _proc.StopAsync(); } catch { }
+                    try { await _proc.StopAsync(false); } catch { }
                     throw;
                 }
                 catch (Exception ex)
                 {
                     last = ex;
                     _bridgeHealth.RecordResult(line, false);
-                    try { await _proc.StopAsync(); } catch { }
+                    try { await _proc.StopAsync(false); } catch { }
                     LogMessage?.Invoke(this,
                         $"Bridge candidate {BridgeHealthStore.ShortName(line)} failed — trying next.");
                     ThrowIfStopping();
@@ -408,11 +487,12 @@ namespace PTor
                     {
                         LogMessage?.Invoke(this, "Trying direct guards...");
                         var direct = BridgeConfigEngine.Resolve(BridgeConfig.DirectOnly(), PtToolsDir, defaults);
-                        if (_proc.IsRunning) await _proc.StopAsync();
+                        if (_proc.IsRunning) await _proc.StopAsync(false);
                         _proc.Start(null);
                         _lastResolved = direct;
                         StartRelays();
                         await WaitForBootstrapAndConnectControl(40);
+                        await WaitForBootstrapCompleteAsync(180, "direct guards");
                         return;
                     }
                     catch (OperationCanceledException) { throw; }
@@ -482,6 +562,11 @@ namespace PTor
             }
             finally { _reconnectGate.Release(); }
 
+            // Pinned to THIS run: a stop+start during the backoff below swaps
+            // _lifetimeCts, and the stale run must not hijack the new tor.
+            var runCts = _lifetimeCts;
+            var runSeq = Volatile.Read(ref _runSeq);
+
             try
             {
                 StateChanged?.Invoke(this, new TorStateChangedEventArgs
@@ -501,7 +586,13 @@ namespace PTor
 
                 // Never resurrect after an explicit stop; the gated restart
                 // section below re-checks, so a stop racing the wait wins.
-                if (_lifetimeCts?.IsCancellationRequested == true)
+                // Generation check first: any start or stop since entry (even
+                // a stop+start that handed us a fresh CTS via a late event)
+                // voids this run.
+                if (Volatile.Read(ref _runSeq) != runSeq ||
+                    !ReferenceEquals(_lifetimeCts, runCts) ||
+                    runCts?.IsCancellationRequested == true ||
+                    _lifetimeCts?.IsCancellationRequested == true)
                 {
                     _reconnectAttempt = 0;
                     _reconnecting = false;
@@ -511,13 +602,18 @@ namespace PTor
                 await _lifecycleGate.WaitAsync();
                 try
                 {
-                    if (_lifetimeCts?.IsCancellationRequested == true)
+                    // Re-check INSIDE the gate: a stop+start may have slipped
+                    // through while waiting for it.
+                    if (Volatile.Read(ref _runSeq) != runSeq ||
+                        !ReferenceEquals(_lifetimeCts, runCts) ||
+                        runCts?.IsCancellationRequested == true ||
+                        _lifetimeCts?.IsCancellationRequested == true)
                     {
                         _reconnectAttempt = 0;
                         _reconnecting = false;
                         return;
                     }
-                    await _proc.StopAsync();
+                    await _proc.StopAsync(false);
                     var last = _lastResolved;
                     _proc.Start(last?.UseBridges == true ? last : null);
                 }
@@ -535,7 +631,7 @@ namespace PTor
                 // Stop during bootstrap: shut the new daemon down, swap in nothing.
                 if (_lifetimeCts?.IsCancellationRequested == true)
                 {
-                    try { await _proc.StopAsync(); } catch { }
+                    try { await _proc.StopAsync(false); } catch { }
                     _reconnectAttempt = 0;
                     _reconnecting = false;
                     return;
@@ -837,7 +933,10 @@ namespace PTor
             catch (Exception ex)
             {
                 _linkFails++;
-                LogMessage?.Invoke(this, $"Tor link check failed ({_linkFails}/{LinkFailThreshold}): {ex.GetType().Name}");
+                // TaskCanceledException here is the 20s HttpClient timeout, not
+                // a crash: name it plainly instead of leaking exception-ese.
+                var why = ex is TaskCanceledException ? "timed out" : ex.GetType().Name;
+                LogMessage?.Invoke(this, $"Tor link check failed ({_linkFails}/{LinkFailThreshold}): {why}");
                 if (_linkFails >= LinkFailThreshold)
                 {
                     _linkFails = 0;
@@ -958,6 +1057,13 @@ namespace PTor
         }
 
         // Identity is (pid, startTime, path): exe+dir stops impostors, start-time stops PID recycling.
+        // No enforcement running means no transports of interest: drop
+        // retained PIDs instead of carrying dead ones.
+        void ClearTransportPids()
+        {
+            try { lock (_ptGate) { _ptKnown.Clear(); } } catch { }
+        }
+
         internal HashSet<int> GetTransportPids()
         {
             var out_ = new HashSet<int>();
@@ -1081,6 +1187,7 @@ namespace PTor
                 try { _divert?.Dispose(); }
                 catch (Exception ex) { return "Disabling enforcement failed: " + ex.Message; }
                 finally { _divert = null; }
+                ClearTransportPids();
                 string dnsNote;
                 try
                 {
@@ -1174,6 +1281,13 @@ namespace PTor
 
         public SystemProxyManager.ProxySnapshot GetProxySnapshot() => _proxy.GetSnapshot();
 
+        // Recent tor daemon log lines (Config shows them; empty when tor never started).
+        public List<string> GetTorLogTail()
+        {
+            try { return _proc.GetLogTail(); }
+            catch { return new List<string>(); }
+        }
+
         public string HeaderSpoof
         {
             get { try { return _bridge.SpoofHost; } catch { return ""; } }
@@ -1222,6 +1336,12 @@ namespace PTor
             StopLinkChecks();
             _linkFails = 0;
             _softRecoverStreak = 0;
+            // A stop ends all reconnect interest, including a backoff
+            // sleeping elsewhere (its generation check makes it stand down).
+            _reconnecting = false;
+            _reconnectAttempt = 0;
+            Interlocked.Increment(ref _runSeq);
+            ClearTransportPids();
 
             try
             {
@@ -1271,14 +1391,49 @@ namespace PTor
             }
 
             _maintenance?.Dispose();
-            _control?.Dispose();
+
+            var torSw = Stopwatch.StartNew();
+            ExitTrace.Log("engine stop: tor stop begin");
+            // Graceful first: ask tor itself to shut down over control. It
+            // then dies on its own, which StopAsync observes via the Exited
+            // event (no fixed waits anywhere on this path). Capped courtesy:
+            // a wedged control must not eat the stop budget — StopAsync's
+            // bounded kill comes next regardless.
+            bool askedNicely = false;
+            try
+            {
+                var control = _control;
+                if (control != null && control.IsConnected)
+                {
+                    var signal = control.SignalShutdownAsync();
+                    var winner = Task.WhenAny(signal, Task.Delay(5000)).GetAwaiter().GetResult();
+                    if (winner == signal)
+                    {
+                        try { askedNicely = signal.GetAwaiter().GetResult(); }
+                        catch { askedNicely = false; }
+                    }
+                    else
+                    {
+                        // Abandoned loser: observe its exception so nothing
+                        // surfaces unobserved on the finalizer thread.
+                        _ = signal.ContinueWith(t => { var _ = t.Exception; },
+                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                    }
+                }
+            }
+            catch { askedNicely = false; }
+            ExitTrace.Log("engine stop: graceful " + (askedNicely ? "accepted" : "skipped/failed"));
+            try { _control?.Dispose(); } catch { }
             _control = null;
 
             try { _bridge.Dispose(); } catch { }
             try { _socksRelay.Dispose(); } catch { }
-            try { _proc.StopAsync().GetAwaiter().GetResult(); } catch { }
+            try { _proc.StopAsync(askedNicely).GetAwaiter().GetResult(); }
+            catch (Exception ex) { ExitTrace.Log("engine stop: tor stop threw " + ex.GetType().Name); }
+            ExitTrace.Log("engine stop: tor stop done in " + torSw.ElapsedMilliseconds + "ms");
 
             VerifyStoppedSync();
+            ExitTrace.Log("engine stop: core sync done");
         }
 
         // Trust-but-verify: a stop that leaves a live tor or managed system
