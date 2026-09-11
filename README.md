@@ -1,19 +1,7 @@
 # PTor
 
-Tor traffic router for Windows, plus an `Uninstall` companion.
-
-Routes this Windows user's apps through Tor via the system proxy and inherited
-env vars, with an optional Tor-only packet lockdown (WinDivert). Single
-instance — only one copy runs at a time. No filter lists, no hosts-file
-games: only your own manual Blocked Domains list is enforced.
-
-## Layout
-
-- `src/` — all source: the `PTor` WPF app, the `Uninstall` console companion,
-  the bundled `tools/` (Tor Expert Bundle, pluggable transports, GeoIP data,
-  WinDivert driver), `rescue-internet.bat`, and the user-facing `README.md`.
-- `Release/` folders, `bin/`, `obj/` are local build outputs and are not
-  committed. Ship binaries through GitHub Releases instead.
+Tor traffic router.  
+PTor will re-route all traffics through TOR network automatically without touching proxy settings on individual app.
 
 ## Build
 
@@ -31,13 +19,11 @@ This publishes self-contained single-file `PTor.exe` + `Uninstall.exe` (plus
 Debug builds run unelevated; Release builds require administrator rights
 (needed for the lockdown driver and DNS repair).
 
-## If your internet breaks
+## How-to recover when losing direct connection after use.
 
-1. Start PTor again — it detects stale proxy/env/DNS state on boot and
-   repairs it automatically.
-2. If PTor won't start, run `rescue-internet.bat` (next to `PTor.exe`) as
+1. If PTor won't start, run `rescue-internet.bat` (next to `PTor.exe`) as
    administrator — the same repair without the app.
-3. Last resort: run `Uninstall.exe` as administrator, then reboot when it
+2. Last resort: run `Uninstall.exe` as administrator, then reboot when it
    finishes (it enforces this). Details in `src/README.md`.
 
 ## Licensing
