@@ -452,6 +452,22 @@ Log notice stdout
             catch { return true; } // uninterrogable: treat as gone, disposal below still runs
         }
 
+        // Instant kill for exit paths: fire SIGKILL, wait for nothing. The
+        // death-pact job reaps transports with us; the OS reaps the rest on
+        // process death. No waits by design — the caller is dying anyway.
+        public void KillTreeNow()
+        {
+            _stopping = true; // quiet any in-flight Exited event on the way out
+            _disposing = true;
+            try
+            {
+                var p = _proc;
+                _proc = null;
+                try { if (p != null && !p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+            }
+            catch { }
+        }
+
         void RaiseState(TorState state, string msg, int? pct = null) =>
             StateChanged?.Invoke(this, new TorStateChangedEventArgs { State = state, Message = msg, BootstrapPercent = pct });
 

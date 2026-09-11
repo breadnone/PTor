@@ -87,7 +87,6 @@ namespace PTor
         readonly List<Control> _busyLockControls = new List<Control>();
 
         bool _useTor = true;
-        bool _reallyClose;
         bool _shuttingDown;
         bool _updating;
         bool _startingTor;
@@ -140,6 +139,7 @@ namespace PTor
             Closing += MainWindow_Closing;
             // Safety net: never leave a ghost tray icon behind, whatever path closed us.
             Closed += (_, __) => { try { _trayIcon.Dispose(); } catch { } };
+            try { Application.Current.SessionEnding += (_, __) => OnSystemSessionEnding(); } catch { }
             StateChanged += MainWindow_StateChanged;
 
             _routingHandler.TorSocksHost = "127.0.0.1";
@@ -813,7 +813,6 @@ namespace PTor
             // interference while tearing down for the handover.
             _shuttingDown = true;
             try { _appMonitorTimer?.Stop(); } catch { }
-            try { await _engine.StopAsync(); } catch { }
             try
             {
                 // The new copy waits for THIS pid to exit (releasing the
@@ -834,13 +833,13 @@ namespace PTor
                 try { _appMonitorTimer?.Start(); } catch { }
                 return;
             }
-            ExitTrace.Log("restart teardown (relaunch)");
-            _reallyClose = true;
-            ArmExitFailsafe("restart");
-            try { _trayIcon.Dispose(); } catch { }
-            try { _client.Dispose(); } catch { }
-            Close();
-            Application.Current.Shutdown();
+            string report;
+            try { report = await System.Threading.Tasks.Task.Run(() => _engine.FastTeardownForExit()); }
+            catch (Exception ex) { report = "fast teardown issue: " + ex.Message; }
+            ExitTrace.Log("restart restored: " + report);
+            try { _trayIcon.Hide(); } catch { }
+            ExitTrace.Log("restart bye");
+            try { Environment.Exit(0); } catch { try { Process.GetCurrentProcess().Kill(); } catch { } }
         }
 
         async System.Threading.Tasks.Task RestartAsAdminAsync()
@@ -857,7 +856,6 @@ namespace PTor
             AppendStatusLine("Stopping Tor and restarting as administrator...");
             _shuttingDown = true;
             try { _appMonitorTimer?.Stop(); } catch { }
-            try { await _engine.StopAsync(); } catch { }
             try
             {
                 var me = Process.GetCurrentProcess().Id;
@@ -871,13 +869,13 @@ namespace PTor
                 try { _appMonitorTimer?.Start(); } catch { }
                 return;
             }
-            ExitTrace.Log("restart teardown (elevated relaunch)");
-            _reallyClose = true;
-            ArmExitFailsafe("elevated restart");
-            try { _trayIcon.Dispose(); } catch { }
-            try { _client.Dispose(); } catch { }
-            Close();
-            Application.Current.Shutdown();
+            string report;
+            try { report = await System.Threading.Tasks.Task.Run(() => _engine.FastTeardownForExit()); }
+            catch (Exception ex) { report = "fast teardown issue: " + ex.Message; }
+            ExitTrace.Log("elevated restart restored: " + report);
+            try { _trayIcon.Hide(); } catch { }
+            ExitTrace.Log("elevated restart bye");
+            try { Environment.Exit(0); } catch { try { Process.GetCurrentProcess().Kill(); } catch { } }
         }
 
         async System.Threading.Tasks.Task UpdateTorBundle()
@@ -1361,12 +1359,24 @@ namespace PTor
 
         void MainWindow_Closing(object sender, CancelEventArgs e)
         {
-            // During shutdown teardown must proceed: never cancel/hide here.
-            if (_reallyClose || _shuttingDown) return;
+            // Minimize-to-tray, never actual close (exits die via
+            // Environment.Exit instead): during shutdown let it proceed.
+            if (_shuttingDown) return;
             e.Cancel = true;
-            ClearAppRows();
             Hide();
             _trayIcon.Show();
+        }
+
+        // Windows itself is going down (shutdown/reboot/logoff): our Closing
+        // handler hides-to-tray by default, which would stall the OS session.
+        // Restore networking fast, then get out of the way (no self-kill
+        // needed — the OS is already terminating us).
+        void OnSystemSessionEnding()
+        {
+            try { ExitTrace.Log("os session ending: fast restore, not blocking"); } catch { }
+            _shuttingDown = true;
+            try { System.Threading.Tasks.Task.Run(() => _engine.FastTeardownForExit()).GetAwaiter().GetResult(); }
+            catch { }
         }
 
         // Display-only data must not outlive visibility: drop rows + streaks
@@ -1442,68 +1452,24 @@ namespace PTor
                         AppendStatusLine($"Quitting — remember to restart the {affected} listed app(s).");
                 }
 
-                AppendStatusLine("Shutting down Tor...");
-                SetBusy(true, "Shutting down…");
+                AppendStatusLine("Restoring network and exiting...");
                 try { _appMonitorTimer?.Stop(); } catch { }
-                var sw = Stopwatch.StartNew();
-                try
-                {
-                    // Never let a wedged stop hang the exit: bound the wait, then
-                    // continue to teardown regardless (StopAsync's verification
-                    // pass already best-effort repaired proxy/env/DNS).
-                    await System.Threading.Tasks.Task.Run(() => _engine.StopAsync())
-                        .WaitAsync(TimeSpan.FromSeconds(25));
-                    ExitTrace.Log("exit engine stop done in " + sw.ElapsedMilliseconds + "ms");
-                }
-                catch (Exception ex)
-                {
-                    ExitTrace.Log("exit engine stop issue after " + sw.ElapsedMilliseconds + "ms: " + ex.GetType().Name);
-                    AppendStatusLine("Shutdown stop issue (continuing to exit): " + ex.GetType().Name);
-                }
+                string report;
+                try { report = await System.Threading.Tasks.Task.Run(() => _engine.FastTeardownForExit()); }
+                catch (Exception ex) { report = "fast teardown issue: " + ex.Message; }
+                ExitTrace.Log("exit restored: " + report);
+                // Tray icon off first (no ghost), then deterministic death:
+                // shared state is restored above, tor is killed, and the
+                // death-pact job reaps anything left. No dispatcher dance.
+                try { _trayIcon.Hide(); } catch (Exception ex) { ExitTrace.Log("exit tray hide: " + ex.GetType().Name); }
+                ExitTrace.Log("exit bye");
             }
             catch (Exception ex)
             {
-                // Any unexpected failure above must STILL tear down below: a
-                // latched _shuttingDown on a live app was the un-exitable state.
-                ExitTrace.Log("exit UNEXPECTED, forcing teardown: " + ex.GetType().Name + " " + ex.Message);
+                ExitTrace.Log("exit UNEXPECTED, dying anyway: " + ex.GetType().Name + " " + ex.Message);
             }
-            finally
-            {
-                ExitTrace.Log("exit teardown begin");
-                _reallyClose = true;
-                ArmExitFailsafe("tray exit");
-                try { _trayIcon.Dispose(); ExitTrace.Log("exit tray disposed"); }
-                catch (Exception ex) { ExitTrace.Log("exit tray dispose: " + ex.GetType().Name); }
-                try { _client.Dispose(); }
-                catch (Exception ex) { ExitTrace.Log("exit client dispose: " + ex.GetType().Name); }
-                try { Close(); ExitTrace.Log("exit Close returned"); }
-                catch (Exception ex) { ExitTrace.Log("exit Close threw: " + ex.GetType().Name); }
-                try { Application.Current.Shutdown(); ExitTrace.Log("exit Shutdown returned"); }
-                catch (Exception ex) { ExitTrace.Log("exit Shutdown threw: " + ex.GetType().Name); }
-            }
-        }
-
-        // Last resort, armed once teardown starts: if anything below hangs
-        // (Close/Shutdown included), the process force-exits at 90s instead
-        // of sticking forever. Normal exits finish in seconds, so this can
-        // only fire when truly stuck. Background pool thread: evaporates with
-        // a clean exit, never delays one.
-        static void ArmExitFailsafe(string why)
-        {
-            try
-            {
-                _ = System.Threading.Tasks.Task.Run(async () =>
-                {
-                    try
-                    {
-                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(90));
-                        try { ExitTrace.Log("FAILSAFE fired 90s after " + why + " — forcing process exit."); } catch { }
-                        try { Environment.Exit(42); } catch { }
-                    }
-                    catch { }
-                });
-            }
-            catch { }
+            try { Environment.Exit(0); }
+            catch { try { Process.GetCurrentProcess().Kill(); } catch { } }
         }
     }
 

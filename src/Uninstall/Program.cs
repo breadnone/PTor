@@ -1,6 +1,8 @@
 // PTor Uninstall companion (Uninstall.exe).
 //
-// Removes every trace PTor can leave on a system:
+// Removes every trace PTor can leave on a system. Same concept as
+// rescue-internet.bat (compare-before-restore, only ours goes, full
+// reporting) plus uninstall-only extras (keys, folders, reboot):
 //   1. stops running PTor.exe (+ orphaned tor.exe under the app folder),
 //   2. restores HKCU proxy / env vars and HKLM DNS resolvers PTor managed,
 //   3. deletes PTor's registry keys (HKCU\Software\PTor, HKLM\SOFTWARE\PTor),
@@ -9,6 +11,8 @@
 //      A foreign WinDivert service is left untouched and reported.
 //   5. deletes the per-user (%AppData%\PTor) and machine (%ProgramData%\PTor)
 //      special folders, flushes the DNS cache,
+//   5b.marker-less fallbacks (proxy env vars / WinHTTP proxy still aimed at
+//      our loopback bridge with no markers left to prove it),
 //   6. optionally deletes the program folder itself (scheduled after exit).
 //
 // Flags: --dry-run (print everything, change nothing), --yes (no prompts).
@@ -148,6 +152,12 @@ DeleteDir(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Appli
 DeleteDir(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "PTor"), "%ProgramData%\\PTor");
 FlushDns();
 
+// --- 5b. marker-less fallbacks (mirrors rescue-internet.bat tail: proxy env
+// vars and WinHTTP proxy still aimed at our loopback bridge with no markers
+// left to prove it — only exact matches go, everything else is untouched) ---
+FallbackProxyEnvVars();
+FallbackWinHttpProxy();
+
 // --- 6. optional: program folder itself ---
 bool looksLikeInstall = File.Exists(Path.Combine(appDir, "PTor.exe"))
     || Directory.Exists(Path.Combine(appDir, "tools", "WinDivert"));
@@ -260,6 +270,71 @@ void FlushDns()
         Say("DNS cache: flushed.");
     }
     catch (Exception ex) { Say("DNS cache: flush failed (" + ex.Message + ")."); }
+}
+
+void FallbackProxyEnvVars()
+{
+    // Same marker as the rescue script: our bridge default. .NET's setter
+    // broadcasts WM_SETTINGCHANGE itself (the bat needs its setx trick).
+    const string marker = "127.0.0.1:9080";
+    string[] vars = { "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy" };
+    int total = 0;
+    foreach (var scope in new[] { EnvironmentVariableTarget.User, EnvironmentVariableTarget.Machine })
+    {
+        foreach (var name in vars)
+        {
+            string? cur = null;
+            try { cur = Environment.GetEnvironmentVariable(name, scope); } catch { continue; }
+            if (string.IsNullOrEmpty(cur) || cur.IndexOf(marker, StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+            if (dryRun) { total++; continue; }
+            try { Environment.SetEnvironmentVariable(name, null, scope); total++; }
+            catch (Exception ex) { Say($"  FALLBACK ENV: could not clear {scope}/{name} ({ex.Message})."); }
+        }
+    }
+    Say(total > 0
+        ? $"FALLBACK ENV: {(dryRun ? "would clear " : "cleared ")}{total} leftover proxy variable(s) pointing at {marker}."
+        : $"FALLBACK ENV: no leftover {marker} proxy variables found.");
+}
+
+void FallbackWinHttpProxy()
+{
+    const string marker = "127.0.0.1:9080";
+    if (dryRun) { Say("WinHTTP proxy: would reset if pointing at 127.0.0.1:9080."); return; }
+    try
+    {
+        string Netsh() => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "netsh.exe");
+        string output = "";
+        using (var p = Process.Start(new ProcessStartInfo
+        {
+            FileName = Netsh(), Arguments = "winhttp show proxy",
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        }))
+        {
+            if (p != null)
+            {
+                p.WaitForExit(15000);
+                try { output = p.StandardOutput.ReadToEnd() ?? ""; } catch { }
+            }
+        }
+        if (output.IndexOf(marker, StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            Say("FALLBACK PROXY: WinHTTP proxy not pointing at 127.0.0.1:9080, left as-is.");
+            return;
+        }
+        using (var q = Process.Start(new ProcessStartInfo
+        {
+            FileName = Netsh(), Arguments = "winhttp reset proxy",
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        }))
+        {
+            q?.WaitForExit(15000);
+        }
+        Say("FALLBACK PROXY: WinHTTP proxy was still set to 127.0.0.1:9080, reset to direct access.");
+    }
+    catch (Exception ex) { Say("FALLBACK PROXY check failed (" + ex.Message + ")."); }
 }
 
 void ScheduleReboot()

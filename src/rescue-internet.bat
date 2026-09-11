@@ -1,8 +1,9 @@
 @echo off
 rem PTor emergency network rescue. Restores proxy, environment variables and
 rem DNS resolvers left behind by a crashed or killed PTor, flushes the DNS
-rem cache, clears stale checkpoints and removes a leftover WinDivert service.
-rem Safe to run anytime: anything not marked as PTor-managed is left alone.
+rem cache, clears stale checkpoints and removes PTor's own leftover WinDivert
+rem service. Safe to run anytime: anything not marked as PTor-managed (or not
+rem provably PTor's, like a foreign WinDivert service) is left alone.
 rem Requires administrator rights: re-launches itself via UAC when needed.
 setlocal
 cd /d "%~dp0"
@@ -45,9 +46,16 @@ sc query WinDivert >nul 2>nul
 if errorlevel 1 (
   echo Driver service not installed, nothing to do.
 ) else (
-  sc stop WinDivert >nul 2>nul
-  sc delete WinDivert >nul 2>nul
-  echo Driver service removal requested. A reboot clears it if still marked for deletion.
+  rem Same concept as Uninstall.exe: only ours goes (image path match or our
+  rem checkpoint says we created it). A foreign service is left untouched.
+  call :IsOursService
+  if not errorlevel 1 (
+    sc stop WinDivert >nul 2>nul
+    sc delete WinDivert >nul 2>nul
+    echo PTor's driver service removed. A reboot clears it if still marked for deletion.
+  ) else (
+    echo A WinDivert service exists but is NOT PTor's - left untouched. Remove it manually ^(sc delete WinDivert^) only if you know which app installed it.
+  )
 )
 
 echo --- fallback cleanup (no PTor markers found) ---
@@ -61,3 +69,20 @@ echo windows and open a new one before testing - existing sessions cache the
 echo old values and will not reflect the fix until reopened.
 pause
 endlocal
+exit /b 0
+
+rem %1 unused. Succeeds (errorlevel 0) only if the WinDivert service is ours:
+rem its image points at this install's tools\WinDivert sys, or our checkpoint
+rem says we created it. Anything else (or unreadable) fails safe: keep it.
+:IsOursService
+set "WIMG="
+for /f "tokens=1* delims=:" %%A in ('sc qc WinDivert 2^>nul ^| findstr /i /c:"BINARY_PATH_NAME"') do set "WIMG=%%B"
+if not defined WIMG exit /b 1
+for /f "tokens=*" %%C in ("%WIMG%") do set "WIMG=%%C"
+set "WIMG=%WIMG:"=%"
+if /i "%WIMG:~0,4%"=="\\?\" set "WIMG=%WIMG:~4%"
+if /i "%WIMG%"=="%~dp0tools\WinDivert\x64\WinDivert64.sys" exit /b 0
+if /i "%WIMG%"=="%~dp0tools\WinDivert\x86\WinDivert32.sys" exit /b 0
+findstr /m /c:"\"DriverService\":\"created\"" "%ProgramData%\PTor\checkpoint.json" >nul 2>nul
+if not errorlevel 1 exit /b 0
+exit /b 1

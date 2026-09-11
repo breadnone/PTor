@@ -207,6 +207,84 @@ namespace PTor
             }
         }
 
+        // Fast exit teardown: restore every shared system setting, then the
+        // caller kills the process. Used ONLY by exit/restart paths (the app
+        // keeps running through toggle-off/update, which use StopAsync).
+        // Why this is safe to follow with instant death, in order:
+        //  - proxy/env/DNS are plain registry writes (~milliseconds); once
+        //    restored, nothing strands the machine.
+        //  - the divert handle dies with the process: traffic goes normal
+        //    instantly, no driver Join needed. Only our driver SERVICE entry
+        //    may linger, and the checkpoint below covers exactly that.
+        //  - tor+transports are killed explicitly here AND by the death-pact
+        //    job on process death (double-covered, either suffices).
+        //  - a 2s gate wait lets an in-flight start abort first, so it can't
+        //    re-apply routing after our restore (residual race, if any, is
+        //    covered by next-start repair like all leftovers).
+        public string FastTeardownForExit()
+        {
+            var notes = new List<string>();
+            void Note(string s) { try { notes.Add(s); } catch { } }
+            try { _lifetimeCts?.Cancel(); } catch { }
+            bool gateTaken = false;
+            try { gateTaken = _lifecycleGate.Wait(TimeSpan.FromSeconds(2)); } catch { gateTaken = false; }
+            try
+            {
+                RestoreOnce(notes);
+                // Re-verify: a start landing exactly inside our restore would
+                // strand proxy-at-dead-bridge after we die. Every Disable
+                // below is a no-op when not managed, so a second pass only
+                // ever repairs a race, never harms.
+                try
+                {
+                    if (_proxy.MatchesApplied() || _env.MatchesApplied() || _dnsMgr.MatchesApplied())
+                    {
+                        Note("re-apply raced, restoring again");
+                        RestoreOnce(notes);
+                    }
+                }
+                catch { }
+                try { _proc.KillTreeNow(); Note("tor killed"); }
+                catch (Exception ex) { Note("tor kill issue: " + ex.Message); }
+            }
+            finally { if (gateTaken) { try { _lifecycleGate.Release(); } catch { } } }
+            return string.Join(" ", notes);
+        }
+
+        void RestoreOnce(List<string> notes)
+        {
+            void Note(string s) { try { notes.Add(s); } catch { } }
+            // Own driver service entry (checkpoint proves WE created it; a
+            // foreign one is never touched). The divert handle itself needs
+            // nothing: process death closes it.
+            try
+            {
+                var cp = EnforcementCheckpoint.Load();
+                if (cp != null && cp.DriverService == "created")
+                {
+                    string res;
+                    try { res = DivertNative.RemoveService(); }
+                    catch (Exception ex) { res = "remove failed: " + ex.Message; }
+                    Note("driver service: " + res);
+                    bool gone = false;
+                    try
+                    {
+                        var after = DivertNative.GetServiceInfo();
+                        gone = after == null || !after.Exists;
+                    }
+                    catch { }
+                    // Only forget the checkpoint when the service is actually
+                    // gone; otherwise the next start finishes the cleanup.
+                    if (gone) { try { EnforcementCheckpoint.Delete(); } catch { } }
+                }
+                else { try { EnforcementCheckpoint.Delete(); } catch { } }
+            }
+            catch { }
+            try { Note(_dnsMgr.Disable()); } catch (Exception ex) { Note("DNS restore issue: " + ex.Message); }
+            try { Note(_env.Disable()); } catch (Exception ex) { Note("env restore issue: " + ex.Message); }
+            try { Note(_proxy.Disable()); } catch (Exception ex) { Note("proxy restore issue: " + ex.Message); }
+        }
+
         volatile int _stdoutBootstrapped;
         // Run generation: bumped on every start AND every stop. A reconnect
         // sleeping through either wakes up stale and must stand down, even
