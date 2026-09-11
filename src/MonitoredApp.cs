@@ -13,6 +13,13 @@ namespace PTor
         static readonly SolidColorBrush DirectBrush = new(Color.FromRgb(0xFF, 0x6B, 0x6B));
         static readonly SolidColorBrush DimBrush = new(Color.FromRgb(0xA0, 0xA0, 0xA0));
 
+        // Assigned, never mutated: freeze once.
+        static MonitoredApp()
+        {
+            try { RoutedBrush.Freeze(); DirectBrush.Freeze(); DimBrush.Freeze(); }
+            catch { }
+        }
+
         public int Pid { get; }
 
         string _name;

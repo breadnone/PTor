@@ -33,6 +33,22 @@ namespace PTor
         static readonly SolidColorBrush DarkGreenPressedBrush = new SolidColorBrush(Color.FromRgb(0x12, 0x40, 0x16));
         static readonly SolidColorBrush DisabledBrush = new SolidColorBrush(Color.FromRgb(0x3A, 0x3A, 0x3A));
 
+        // These brushes are created once and never mutated (all UI updates
+        // assign them, never write into them): freeze for cheaper rendering
+        // and safe cross-thread reads. TextBrush is a framework frozen brush.
+        static MainWindow()
+        {
+            try
+            {
+                BgBrush.Freeze(); PanelBrush.Freeze(); AccentBrush.Freeze();
+                DimBrush.Freeze(); DangerBrush.Freeze(); GoodBrush.Freeze();
+                WarnBrush.Freeze(); DarkGreenBrush.Freeze();
+                DarkGreenHoverBrush.Freeze(); DarkGreenPressedBrush.Freeze();
+                DisabledBrush.Freeze();
+            }
+            catch { }
+        }
+
         readonly ObservableCollection<RequestLogEntry> _log = new ObservableCollection<RequestLogEntry>();
         readonly ObservableCollection<string> _blockedDomains = new ObservableCollection<string>();
         readonly DomainRoutingHandler _routingHandler;
@@ -110,7 +126,7 @@ namespace PTor
             var uaErr = ApplyUserAgent(_settings.UserAgent ?? "");
             if (uaErr != null) AppendStatusLine(uaErr);
 
-            BuildMainAppRows();
+            RepopulateAppRows();
             _appMonitorTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
             _appMonitorTimer.Tick += (_, __) => MainAppMonitorTick();
             _appMonitorTimer.Start();
@@ -1100,14 +1116,23 @@ namespace PTor
             catch { }
         }
 
-        void BuildMainAppRows()
+        // The Apps list is display-only info: it is cleared whenever the
+        // window hides (no stale/dead rows accumulate unseen) and rebuilt
+        // from a fresh enumeration on every restore. Single-flight: overlapping
+        // restores converge on exactly one rebuild, and the UI callback always
+        // clears before adding, so duplicates are impossible by construction
+        // (merges elsewhere only ever add PIDs missing from current rows).
+        bool _repopulating;
+
+        void RepopulateAppRows()
         {
-            // One-time population, same off-UI rule (first paint wins over rows).
+            if (_repopulating) return;
+            _repopulating = true;
             _ = System.Threading.Tasks.Task.Run(() =>
             {
                 List<RunningAppInfo> list;
                 try { list = RunningAppEnumerator.GetNonSystemUserApps(); }
-                catch { return; }
+                catch { list = new List<RunningAppInfo>(); }
                 SafeBeginInvoke(() =>
                 {
                     try
@@ -1117,6 +1142,7 @@ namespace PTor
                             _appRows.Add(new MonitoredApp(a.Pid, a.Name, a.ExePath));
                     }
                     catch { }
+                    finally { _repopulating = false; }
                 });
             });
         }
@@ -1319,6 +1345,7 @@ namespace PTor
             WindowState = WindowState.Normal;
             Activate();
             _trayIcon.Hide();
+            RepopulateAppRows();
         }
 
         void MainWindow_StateChanged(object sender, EventArgs e)
@@ -1326,6 +1353,7 @@ namespace PTor
             if (_shuttingDown) return;
             if (WindowState == WindowState.Minimized)
             {
+                ClearAppRows();
                 Hide();
                 _trayIcon.Show();
             }
@@ -1336,8 +1364,18 @@ namespace PTor
             // During shutdown teardown must proceed: never cancel/hide here.
             if (_reallyClose || _shuttingDown) return;
             e.Cancel = true;
+            ClearAppRows();
             Hide();
             _trayIcon.Show();
+        }
+
+        // Display-only data must not outlive visibility: drop rows + streaks
+        // the moment we hide, so nothing dead accumulates unseen. UI thread
+        // only, like every other _appRows touch.
+        void ClearAppRows()
+        {
+            try { _appRows.Clear(); } catch { }
+            try { _streakTracker.Clear(); } catch { }
         }
 
         async System.Threading.Tasks.Task ExitApplication()

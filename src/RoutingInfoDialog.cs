@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -338,12 +339,11 @@ namespace PTor
                 Padding = new Thickness(8, 5, 8, 5),
                 Margin = new Thickness(0, 0, 0, 8)
             };
-            // The drop-down popup paints the system (white) background, so
-            // items need explicit dark-on-light styling to stay readable.
-            var itemStyle = new Style(typeof(ComboBoxItem));
-            itemStyle.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.Black));
-            itemStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
-            _bridgeModeBox.ItemContainerStyle = itemStyle;
+            // Stock ComboBox chrome ignores Background (white box, white popup:
+            // the active mode renders white-on-white). Full dark template.
+            StyleDarkComboBox(_bridgeModeBox,
+                new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20)), textBrush,
+                new SolidColorBrush(Color.FromRgb(0x45, 0x45, 0x45)), accentBrush);
             _bridgeModeBox.Items.Add("Direct (no bridges)");
             _bridgeModeBox.Items.Add("obfs4 — bundled bridges");
             _bridgeModeBox.Items.Add("Snowflake — bundled");
@@ -618,6 +618,86 @@ namespace PTor
             Cursor = System.Windows.Input.Cursors.Hand
         };
 
+        // Dark ComboBox chrome: dark box + dark popup, light text, accent
+        // highlight. Selection behavior (SelectedIndex/SelectedItem, keyboard,
+        // drop-down open/close) is untouched — only the visuals.
+        static void StyleDarkComboBox(ComboBox box, Brush bg, Brush fg, Brush border, Brush accent)
+        {
+            var toggleTemplate = new ControlTemplate(typeof(ToggleButton));
+            var toggleBorder = new FrameworkElementFactory(typeof(Border));
+            toggleBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ToggleButton.BackgroundProperty));
+            toggleBorder.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(ToggleButton.BorderBrushProperty));
+            toggleBorder.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(ToggleButton.BorderThicknessProperty));
+            var arrow = new FrameworkElementFactory(typeof(System.Windows.Shapes.Path));
+            arrow.SetValue(System.Windows.Shapes.Path.DataProperty, Geometry.Parse("M 0 0 L 4 4 L 8 0 Z"));
+            arrow.SetValue(System.Windows.Shapes.Path.FillProperty, fg);
+            arrow.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right);
+            arrow.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            arrow.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 10, 0));
+            toggleBorder.AppendChild(arrow);
+            toggleTemplate.VisualTree = toggleBorder;
+
+            var template = new ControlTemplate(typeof(ComboBox));
+            var grid = new FrameworkElementFactory(typeof(Grid));
+            var toggle = new FrameworkElementFactory(typeof(ToggleButton));
+            toggle.SetValue(ToggleButton.TemplateProperty, toggleTemplate);
+            toggle.SetValue(ToggleButton.BackgroundProperty, bg);
+            toggle.SetValue(ToggleButton.BorderBrushProperty, border);
+            toggle.SetValue(ToggleButton.BorderThicknessProperty, new Thickness(1));
+            toggle.SetValue(ToggleButton.FocusableProperty, false);
+            toggle.SetValue(ToggleButton.ClickModeProperty, ClickMode.Press);
+            toggle.SetBinding(ToggleButton.IsCheckedProperty, new Binding("IsDropDownOpen")
+            {
+                RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent),
+                Mode = BindingMode.TwoWay
+            });
+            var content = new FrameworkElementFactory(typeof(ContentPresenter));
+            content.SetValue(ContentPresenter.MarginProperty, new Thickness(8, 5, 26, 5));
+            content.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            content.SetValue(ContentPresenter.IsHitTestVisibleProperty, false);
+            content.SetValue(ContentPresenter.ContentProperty,
+                new TemplateBindingExtension(ComboBox.SelectionBoxItemProperty));
+            var popup = new FrameworkElementFactory(typeof(Popup));
+            popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
+            popup.SetValue(Popup.AllowsTransparencyProperty, true);
+            popup.SetValue(Popup.FocusableProperty, false);
+            popup.SetValue(Popup.PopupAnimationProperty, PopupAnimation.Slide);
+            popup.SetValue(Popup.StaysOpenProperty, false);
+            popup.SetValue(Popup.IsOpenProperty,
+                new TemplateBindingExtension(ComboBox.IsDropDownOpenProperty));
+            var popupBorder = new FrameworkElementFactory(typeof(Border));
+            popupBorder.SetValue(Border.BackgroundProperty, bg);
+            popupBorder.SetValue(Border.BorderBrushProperty, border);
+            popupBorder.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+            popupBorder.SetValue(Border.MinWidthProperty,
+                new TemplateBindingExtension(ComboBox.ActualWidthProperty));
+            popupBorder.SetValue(Border.MaxHeightProperty,
+                new TemplateBindingExtension(ComboBox.MaxDropDownHeightProperty));
+            var scroll = new FrameworkElementFactory(typeof(ScrollViewer));
+            scroll.AppendChild(new FrameworkElementFactory(typeof(ItemsPresenter)));
+            popupBorder.AppendChild(scroll);
+            popup.AppendChild(popupBorder);
+            grid.AppendChild(toggle);
+            grid.AppendChild(content);
+            grid.AppendChild(popup);
+            template.VisualTree = grid;
+            box.Template = template;
+
+            var itemStyle = new Style(typeof(ComboBoxItem));
+            itemStyle.Setters.Add(new Setter(Control.BackgroundProperty, bg));
+            itemStyle.Setters.Add(new Setter(Control.ForegroundProperty, fg));
+            itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8, 4, 8, 4)));
+            var highlighted = new Trigger { Property = ComboBoxItem.IsHighlightedProperty, Value = true };
+            highlighted.Setters.Add(new Setter(Control.BackgroundProperty, accent));
+            highlighted.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.Black));
+            itemStyle.Triggers.Add(highlighted);
+            var selected = new Trigger { Property = ComboBoxItem.IsSelectedProperty, Value = true };
+            selected.Setters.Add(new Setter(Control.BackgroundProperty, accent));
+            selected.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.Black));
+            itemStyle.Triggers.Add(selected);
+            box.ItemContainerStyle = itemStyle;
+        }
+
         async System.Threading.Tasks.Task VerifyExitIpAsync()
         {
             _verifyResult.Text = "Checking via system proxy…";
@@ -787,10 +867,10 @@ namespace PTor
                 Padding = new Thickness(8, 5, 8, 5),
                 Margin = new Thickness(0, 6, 0, 0)
             };
-            var regionStyle = new Style(typeof(ComboBoxItem));
-            regionStyle.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.Black));
-            regionStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
-            _geoRegionBox.ItemContainerStyle = regionStyle;
+            StyleDarkComboBox(_geoRegionBox,
+                new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20)), textBrush,
+                new SolidColorBrush(Color.FromRgb(0x45, 0x45, 0x45)),
+                new SolidColorBrush(Color.FromRgb(0x60, 0xCD, 0xFF)));
             var regions = new System.Collections.Generic.List<string>(TorPathOptions.ExitRegions.Keys);
             regions.Sort(StringComparer.Ordinal);
             foreach (var r in regions) _geoRegionBox.Items.Add(r);
