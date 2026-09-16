@@ -1,0 +1,12 @@
+﻿<Application x:Class="PTor.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:PTor">
+    <!-- No StartupUri by design: the main window is created manually in
+         OnStartup ONLY after this instance owns the single-instance lock.
+         A StartupUri window would be constructed (and auto-start tor via
+         Loaded) even for rejected second instances. -->
+    <Application.Resources>
+         
+    </Application.Resources>
+</Application>
