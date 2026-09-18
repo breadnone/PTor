@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Uninstall</AssemblyName>
+    <AssemblyCompany>PTor</AssemblyCompany>
+    <AssemblyProduct>PTor Uninstall</AssemblyProduct>
+    <AssemblyDescription>Removes all PTor network/registry/driver traces and restores the previous internet settings.</AssemblyDescription>
+    <AssemblyCopyright>Copyright © PTor contributors</AssemblyCopyright>
+    <!-- NativeAOT: ~3MB self-contained exe, no .NET runtime needed on the
+         target PC (a framework-dependent uninstaller would refuse to launch
+         on machines without the .NET Desktop Runtime — the one program that
+         must never fail to start). -->
+    <PublishAot>true</PublishAot>
+    <!-- English-only (no .resx): skip non-English framework satellites. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- No symbols in Release: the native PDB is ~13MB next to a ~3.5MB
+         exe. Debug (F5) keeps full symbols — this only applies to Release
+         publishes (build-release.bat passes the same flags explicitly). -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+    <!-- Uninstaller always runs elevated: HKLM service/DNS cleanup needs it. -->
+    <ApplicationManifest>..\app.admin.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <!-- Shared with the main app: same restore/audit logic, one implementation. -->
+  <ItemGroup>
+    <Compile Include="..\PtorJsonContext.cs" />
+    <Compile Include="..\BootRestore.cs" />
+    <Compile Include="..\SystemProxyManager.cs" />
+    <Compile Include="..\UserEnvManager.cs" />
+    <Compile Include="..\SystemDnsManager.cs" />
+    <Compile Include="..\AdminHelper.cs" />
+    <Compile Include="..\DivertNative.cs" />
+    <Compile Include="..\EnforcementCheckpoint.cs" />
+    <Compile Include="..\MitmCaManager.cs" />
+    <Compile Include="..\FirefoxTrust.cs" />
+    <Compile Include="..\SafeFiles.cs" />
+  </ItemGroup>
+
+</Project>

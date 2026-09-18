@@ -1,0 +1,661 @@
+using System;
+using System.Buffers;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace PTor
+{
+
+    static class SocksUpstream
+    {
+        // Post-idle/wake/rotation tor needs 5-20s to rebuild circuits, but
+        // apps were failed after ~6s. 5 attempts over ~14s lets an app ride
+        // out a rebuild (slow load) instead of eating a 502 (broken load).
+        // Delays are injectable for tests; production uses the default.
+        static readonly int[] DefaultRetryDelaysMs = { 500, 1500, 4000, 8000 };
+
+        public static async Task<TcpClient?> ConnectWithRetryAsync(
+            string socksHost, int socksPort,
+            string targetHost, int targetPort,
+            Func<NetworkStream, Task<bool>> handshake,
+            CancellationToken ct,
+            int[]? retryDelaysMs = null)
+        {
+            var delays = retryDelaysMs ?? DefaultRetryDelaysMs;
+            var attempts = delays.Length + 1;
+            static void Drop(TcpClient? c) { try { c?.Dispose(); } catch { } }
+
+            var tcp = new TcpClient();
+            try
+            {
+                await tcp.ConnectAsync(socksHost, socksPort, ct);
+            }
+                // Budget expiry (hs) must read as failure, not throw: the
+                // caller still owes the app a verdict (SOCKS 0x01 / HTTP
+                // 502) on a fresh budget. Throwing here turned a
+                // deliverable error into 20s of silence + a bare FIN —
+                // the app hangs with no error instead of failing fast.
+                catch (OperationCanceledException) { Drop(tcp); return null; }
+                catch { Drop(tcp); return null; }
+
+            // Deliberate backoff, not polling: right after a rotation (or a
+            // wake-from-sleep, or a long idle) there is no event for "fresh
+            // circuits ready" (Tor builds them lazily), so we back off while
+            // the data path rebuilds. Cancellation-aware.
+            for (var attempt = 1; attempt <= attempts; attempt++)
+            {
+                if (attempt > 1)
+                {
+                    Drop(tcp);
+                    tcp = new TcpClient();
+                    try
+                    {
+                        await tcp.ConnectAsync(socksHost, socksPort, ct);
+                    }
+                    catch (OperationCanceledException) { Drop(tcp); return null; }
+                    catch { Drop(tcp); return null; }
+                }
+                bool ok;
+                try
+                {
+                    ok = await handshake(tcp.GetStream());
+                }
+                catch (OperationCanceledException) { Drop(tcp); return null; }
+                catch { ok = false; }
+                if (ok) return tcp;
+                if (attempt <= delays.Length)
+                {
+                    try { await Task.Delay(delays[attempt - 1], ct); }
+                    catch (OperationCanceledException) { Drop(tcp); return null; }
+                }
+            }
+            Drop(tcp);
+            return null;
+        }
+    }
+
+    static class StreamRelay
+    {
+        // Bidirectional relay: graceful EOF half-closes only the finished
+        // direction; a real error tears down immediately.
+        // Pump buffers come from the shared pool: CopyToAsync would allocate
+        // ~80 KB per direction per connection (160 KB churn each relay).
+        //
+        // Idle reaper: a relayed connection that moves zero bytes for
+        // IdleTimeout is a zombie — a dead Tor circuit with no FIN, an
+        // abandoned keep-alive, a speculative preconnect nobody claimed.
+        // These used to pin a concurrency-gate slot (plus sockets/buffers)
+        // FOREVER, so after hours of healthy use new app connections were
+        // silently refused while old ones kept working ("some apps can't
+        // get online until restart"). Legit streams heartbeat well inside
+        // this window (WS ping, SSE retry, TLS records); teardown just
+        // makes the app reconnect. Engine stop still wins via ct.
+        internal static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(15);
+        const int PumpBufferSize = 81920;
+        public static async Task PumpBoth(NetworkStream a, Socket aSocket, NetworkStream b, Socket bSocket, CancellationToken ct)
+        {
+            using var idleCts = new CancellationTokenSource(IdleTimeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, idleCts.Token);
+            var pumpCt = linked.Token;
+            void Touch() { try { idleCts.CancelAfter(IdleTimeout); } catch { } }
+
+            async Task<bool> Copy(NetworkStream from, NetworkStream to)
+            {
+                var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(PumpBufferSize);
+                try
+                {
+                    while (true)
+                    {
+                        int n;
+                        try { n = await from.ReadAsync(buf.AsMemory(0, PumpBufferSize), pumpCt); }
+                        catch { return false; }
+                        if (n <= 0) return true;
+                        try { await to.WriteAsync(buf.AsMemory(0, n), pumpCt); }
+                        catch { return false; }
+                        Touch();
+                    }
+                }
+                finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+            }
+
+            var t1 = Copy(a, b);
+            var t2 = Copy(b, a);
+
+            var completed = await Task.WhenAny(t1, t2);
+            bool graceful;
+            try { graceful = completed.Result; } catch { graceful = false; }
+
+            if (!graceful || ct.IsCancellationRequested)
+                return;
+
+            var stillRunning = ReferenceEquals(completed, t1) ? t2 : t1;
+            var finishedInto = ReferenceEquals(completed, t1) ? bSocket : aSocket;
+            try { finishedInto.Shutdown(SocketShutdown.Send); } catch { }
+
+            try { await stillRunning; } catch { }
+        }
+    }
+
+    // Session idle scope for MITM sessions (many transactions over one
+    // gate slot): bounds the whole session by wall-clock idleness. Touch on
+    // any activity; awaits using Token abort with OperationCanceledException
+    // when quiet for StreamRelay.IdleTimeout. All relay/session loops
+    // already propagate that as teardown, and engine stop still wins via
+    // the linked parent ct. Stray Touch calls after Dispose are swallowed
+    // (Touch is invoked defensively everywhere).
+    sealed class SessionIdleScope : IDisposable
+    {
+        readonly CancellationTokenSource _idle;
+        readonly CancellationTokenSource _linked;
+        public CancellationToken Token => _linked.Token;
+        public SessionIdleScope(CancellationToken parent)
+        {
+            _idle = new CancellationTokenSource(StreamRelay.IdleTimeout);
+            _linked = CancellationTokenSource.CreateLinkedTokenSource(parent, _idle.Token);
+        }
+        public void Touch() { try { _idle.CancelAfter(StreamRelay.IdleTimeout); } catch { } }
+        public void Dispose()
+        {
+            try { _linked.Dispose(); } catch { }
+            try { _idle.Dispose(); } catch { }
+        }
+    }
+
+    public class SocksRelay : IDisposable
+    {
+        // Loopback has no auth: cap handlers (fail-fast past it), timeout handshakes.
+        // Same headroom rationale as the HTTP bridge: long-lived streams pin
+        // slots, and a saturated gate drops new app connections outright.
+        const int MaxConcurrent = 512;
+        static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(20);
+        readonly SemaphoreSlim _gate = new(MaxConcurrent, MaxConcurrent);
+
+        readonly string _upstreamHost;
+        readonly int _upstreamPort;
+        TcpListener? _listener;
+        CancellationTokenSource? _cts;
+        readonly object _lifeLock = new();
+
+        public int ListenPort { get; }
+
+        // In-app WebRTC policy (no system changes, live-toggled). The
+        // STUN/TURN host/port gate applies here; with TLS inspection ON,
+        // port-443 streams additionally get full HTTPS filtering (BlockJS /
+        // cookies / CSP, HTTP/2 natively) through the shared MitmPipeline —
+        // same policy as the HTTP-proxy channel, no drift.
+        public bool BlockWebRtc { get; set; }
+
+        public bool BlockJs { get; set; }
+
+        public bool BlockCookies { get; set; }
+
+        public string SpoofHost { get; set; } = "";
+
+        // HTTPS inspection master switch for SOCKS TLS on port 443. When
+        // true (and MitmCa usable), a sniffed TLS ClientHello is terminated
+        // with a per-host leaf from the local CA, filtered decrypted, and
+        // re-encrypted toward the origin through Tor (origins validated
+        // fail-closed, OCSP via Tor). Non-TLS bytes keep the blind path.
+        public bool MitmEnabled { get; set; }
+
+        public MitmCaManager? MitmCa { get; set; }
+
+        // Manual user blocklist (live provider; null = no list). Enforced on
+        // the SOCKS-requested host AND the TLS SNI (domain-fronting cover).
+        public Func<string[]>? BlockedDomainsProvider { get; set; }
+
+        bool IsBlocked(string? host)
+        {
+            try
+            {
+                var p = BlockedDomainsProvider;
+                if (p == null) return false;
+                string[] list;
+                try { list = p(); } catch { return false; }
+                return ContentFilter.IsBlockedDomain(host, list);
+            }
+            catch { return false; }
+        }
+
+        MitmSessionOptions SocksSessionOptions(string host, int port, string tlsTarget) => new()
+        {
+            BlockJs = BlockJs,
+            BlockWebRtc = BlockWebRtc,
+            BlockCookies = BlockCookies,
+            SpoofHost = SpoofHost,
+            ConnectHost = host,
+            ConnectPort = port,
+            TlsTarget = tlsTarget,
+            BlockedDomains = BlockedDomainsProvider,
+            OnRelayed = (h, p, mode, sni) =>
+            {
+                try { Relayed?.Invoke(this, new RelayEventArgs { Host = h, Port = p, Mode = mode, Sni = sni }); }
+                catch { }
+            },
+            SocksDial = (h, p, ct) => SocksUpstream.ConnectWithRetryAsync(
+                _upstreamHost, _upstreamPort, h, p, s => SocksConnectAsync(s, h, p, ct), ct),
+            AuthenticateUpstream = (tls, target, ct) => MitmPipeline.AuthenticateUpstreamAsync(
+                tls, target,
+                (h, p, c) => SocksUpstream.ConnectWithRetryAsync(
+                    _upstreamHost, _upstreamPort, h, p, s => SocksConnectAsync(s, h, p, c), c),
+                null, ct),
+        };
+
+        public event EventHandler<RelayEventArgs>? Relayed;
+
+        public SocksRelay(string upstreamHost, int upstreamPort, int listenPort)
+        {
+            _upstreamHost = upstreamHost;
+            _upstreamPort = upstreamPort;
+            ListenPort = listenPort;
+        }
+
+        public void Start()
+        {
+            // Idempotent: bridge-tier escalation calls Start once per tier;
+            // a second Start must reuse the bound listener, not throw 10048.
+            // Locked vs Dispose (same shape as HttpToSocksBridge).
+            TcpListener listener;
+            CancellationToken token;
+            lock (_lifeLock)
+            {
+                if (_cts != null && !_cts.IsCancellationRequested) return;
+                try { _cts?.Dispose(); } catch { }
+                _cts = new CancellationTokenSource();
+                listener = _listener = new TcpListener(IPAddress.Loopback, ListenPort);
+                token = _cts.Token;
+            }
+            try { listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true); } catch { }
+            try { listener.Start(); }
+            catch { lock (_lifeLock) { if (ReferenceEquals(_listener, listener)) _listener = null; } throw; }
+            _ = AcceptLoop(listener, token);
+        }
+
+        // Saturation signal: refusals used to be silent, so a full gate
+        // looked exactly like "the internet is down for some apps".
+        // Throttled to one log line per 5 minutes; the running total stays
+        // readable via GateDropCount.
+        public event EventHandler<string>? Warned;
+
+        long _gateDrops;
+        long _lastGateWarnTicks;
+        public long GateDropCount { get { try { return Interlocked.Read(ref _gateDrops); } catch { return 0; } } }
+
+        void NoteGateDrop()
+        {
+            try
+            {
+                var n = Interlocked.Increment(ref _gateDrops);
+                var now = DateTime.UtcNow.Ticks;
+                var last = Interlocked.Read(ref _lastGateWarnTicks);
+                if (now - last > TimeSpan.FromMinutes(5).Ticks &&
+                    Interlocked.CompareExchange(ref _lastGateWarnTicks, now, last) == last)
+                {
+                    try { Warned?.Invoke(this,
+                        $"Relay on port {ListenPort} is saturated ({n} connection(s) refused at the concurrency cap). " +
+                        "Idle streams are reaped automatically; if this persists, an app is holding hundreds of connections open."); }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        async Task AcceptLoop(TcpListener listener, CancellationToken ct)
+        {
+            // A transient accept blip must not kill the listener forever
+            // (that wedged ALL new app connections until restart); a
+            // permanently broken listener must not hot-spin either.
+            var acceptFails = 0;
+            while (!ct.IsCancellationRequested)
+            {
+                TcpClient client;
+                try { client = await listener.AcceptTcpClientAsync(ct); }
+                catch (OperationCanceledException) { break; }
+                catch
+                {
+                    if (++acceptFails > 20)
+                    {
+                        try { Warned?.Invoke(this,
+                            $"Relay listener on port {ListenPort} stopped after repeated accept failures — toggle routing to recover."); }
+                        catch { }
+                        break;
+                    }
+                    try { await Task.Delay(250, ct); } catch { break; }
+                    continue;
+                }
+                acceptFails = 0;
+                bool admitted;
+                try { admitted = await _gate.WaitAsync(0, ct); }
+                catch { try { client.Dispose(); } catch { } break; }
+                if (!admitted) { NoteGateDrop(); try { client.Dispose(); } catch { } continue; }
+                _ = HandleAndReleaseAsync(client, ct);
+            }
+        }
+
+        async Task HandleAndReleaseAsync(TcpClient client, CancellationToken ct)
+        {
+            try { await HandleClientAsync(client, ct); }
+            finally { try { _gate.Release(); } catch { } }
+        }
+
+        async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+        {
+            using (client)
+            {
+                NetworkStream stream;
+                try { stream = client.GetStream(); }
+                catch { return; }
+                // Timeout covers the handshake only; the relay pump below stays untimed.
+                using var hsTimeout = new CancellationTokenSource(HandshakeTimeout);
+                using var hsCts = CancellationTokenSource.CreateLinkedTokenSource(ct, hsTimeout.Token);
+                var hs = hsCts.Token;
+                // Verdict replies go out on a fresh short budget linked to
+                // the engine token, never on hs: after the ~14s Tor retry
+                // loop hs is usually expired, and writing the verdict on it
+                // turns a deliverable SOCKS reply into a bare FIN — the app
+                // hangs with no error instead of failing fast.
+                async Task<bool> ReplyAsync(byte[] bytes)
+                {
+                    try
+                    {
+                        using var rcts = ReplyCts(ct);
+                        await stream.WriteAsync(bytes, rcts.Token);
+                        return true;
+                    }
+                    catch { return false; }
+                }
+                try
+                {
+
+                    var head = new byte[2];
+                    if (!await TryReadExactAsync(stream, head, hs)) return;
+                    if (head[0] != 0x05 || head[1] == 0) { client.Close(); return; }
+                    var methods = new byte[head[1]];
+                    if (!await TryReadExactAsync(stream, methods, hs)) return;
+                    var ok = false;
+                    foreach (var m in methods) if (m == 0x00) { ok = true; break; }
+                    if (!ok)
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0xFF });
+                        return;
+                    }
+                    await ReplyAsync(new byte[] { 0x05, 0x00 });
+
+                    var req = new byte[4];
+                    if (!await TryReadExactAsync(stream, req, hs)) return;
+                    if (req[0] != 0x05 || req[1] != 0x01)
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        return;
+                    }
+                    string host;
+                    if (req[3] == 0x01)
+                    {
+                        var ip = new byte[4];
+                        if (!await TryReadExactAsync(stream, ip, hs)) return;
+                        host = $"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}";
+                    }
+                    else if (req[3] == 0x03)
+                    {
+                        var lb = new byte[1];
+                        if (!await TryReadExactAsync(stream, lb, hs)) return;
+                        var hb = new byte[lb[0]];
+                        if (hb.Length == 0)
+                        {
+                            await ReplyAsync(new byte[] { 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                            return;
+                        }
+                        if (!await TryReadExactAsync(stream, hb, hs)) return;
+                        host = Encoding.ASCII.GetString(hb);
+                    }
+                    else if (req[3] == 0x04)
+                    {
+                        var ip = new byte[16];
+                        if (!await TryReadExactAsync(stream, ip, hs)) return;
+                        host = new IPAddress(ip).ToString();
+                    }
+                    else
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        return;
+                    }
+                    var pb = new byte[2];
+                    if (!await TryReadExactAsync(stream, pb, hs)) return;
+                    var port = (pb[0] << 8) | pb[1];
+
+                    // Deterministic local failure: an unencodable host can
+                    // never succeed — refuse now (0x08) instead of burning
+                    // the 5-attempt / ~14s retry budget and answering late.
+                    if (HttpToSocksBridge.BuildSocksConnectRequest(host, port) == null)
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        return;
+                    }
+
+                    // User blocklist first (explicit user intent): refuse
+                    // before any upstream work — no circuit spent, no leak.
+                    if (IsBlocked(host))
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "BLOCKED-DOMAIN" }); }
+                        catch { }
+                        return;
+                    }
+
+                    if (BlockWebRtc && ContentFilter.IsWebRtcTarget(host, port))
+                    {
+                        // 0x02 = connection not allowed by ruleset (policy
+                        // block, distinct from 0x01 upstream failure).
+                        await ReplyAsync(new byte[] { 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "BLOCKED-RTC" }); }
+                        catch { }
+                        return;
+                    }
+
+                    var upstream = await SocksUpstream.ConnectWithRetryAsync(
+                        _upstreamHost, _upstreamPort, host, port,
+                        s => SocksConnectAsync(s, host, port, hs), hs);
+                    if (upstream == null)
+                    {
+                        await ReplyAsync(new byte[] { 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+                        return;
+                    }
+                    using (upstream)
+                    {
+                        if (!await ReplyAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 })) return;
+                        // Port-443 TLS inspection: same decrypted policy as
+                        // the HTTP-proxy channel (BlockJS / cookies / CSP,
+                        // blocklist, HTTP/2 natively). Everything else —
+                        // and any TLS that can't be issued — pumps blind.
+                        if (MitmEnabled && MitmCa != null && port == 443)
+                        {
+                            await HandleSocksTlsAsync(stream, client, upstream, host, port, hs, ct);
+                            return;
+                        }
+                        try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "SOCKS" }); }
+                        catch { }
+                        await StreamRelay.PumpBoth(stream, client.Client, upstream.GetStream(), upstream.Client, ct);
+                    }
+                }
+                catch
+                {
+
+                }
+            }
+        }
+
+        // Post-handshake TLS inspection for SOCKS port-443 streams. Peeks the
+        // client's first bytes: a TLS ClientHello is terminated with a
+        // per-host leaf and run through the shared inspection pipeline
+        // (fail-closed origin validation, decrypted filtering, native H2);
+        // anything else — or an unissuable leaf — falls back to the blind
+        // pump with the peeked bytes forwarded verbatim. Inspection is
+        // skipped, never weakened, on any failure.
+        async Task HandleSocksTlsAsync(NetworkStream clientStream, TcpClient client,
+            TcpClient upstream, string host, int port,
+            CancellationToken hs, CancellationToken ct)
+        {
+            var prefix = await ReadTlsPrefixAsync(clientStream, ct);
+            if (prefix == null) return; // engine stopping: exit silently
+            var socksStream = upstream.GetStream();
+            if (prefix.Length > 0 && prefix[0] == 0x16 && MitmCa != null)
+            {
+                string sni = "";
+                try { sni = HttpToSocksBridge.TryParseSni(prefix, prefix.Length); } catch { }
+                // SNI cover: a SOCKS host that passes but a blocked SNI must
+                // still fail closed (domain-fronting shape).
+                if (IsBlocked(host)
+                    || (!string.IsNullOrWhiteSpace(sni) && IsBlocked(ContentFilter.NormalizeHost(sni))))
+                {
+                    try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "BLOCKED-DOMAIN", Sni = sni ?? "" }); }
+                    catch { }
+                    return;
+                }
+                X509Certificate2? leaf = null;
+                try { leaf = MitmCa.GetLeafCertificate(host); } catch { leaf = null; }
+                if (leaf != null)
+                {
+                    var tlsTarget = !string.IsNullOrWhiteSpace(sni) ? sni.Trim() : host;
+                    bool handled = true;
+                    try
+                    {
+                        handled = await MitmPipeline.RunInspectedTunnelAsync(clientStream, client.Client,
+                            upstream, MitmCa, host, port, prefix, sni ?? "",
+                            SocksSessionOptions(host, port, tlsTarget), ct);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch { }
+                    if (handled) return;
+                    // else fall through to the blind path with buffered bytes
+                }
+                // else fall through to the blind path with buffered bytes
+            }
+            if (prefix.Length > 0)
+            {
+                try { await socksStream.WriteAsync(prefix, ct); } catch { return; }
+            }
+            try { Relayed?.Invoke(this, new RelayEventArgs { Host = host, Port = port, Mode = "SOCKS" }); }
+            catch { }
+            await StreamRelay.PumpBoth(clientStream, client.Client, socksStream, upstream.Client, ct);
+        }
+
+        // Reads the start of the client's post-handshake bytes for
+        // inspection routing. Null ONLY on engine shutdown (caller exits
+        // silently); empty array on timeout/EOF (caller takes blind path).
+        static async Task<byte[]?> ReadTlsPrefixAsync(NetworkStream client, CancellationToken ct)
+        {
+            try
+            {
+                using var ms = new MemoryStream();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+                var tmp = ArrayPool<byte>.Shared.Rent(8192);
+                try
+                {
+                    while (ms.Length < 7)
+                    {
+                        int n;
+                        try { n = await client.ReadAsync(tmp.AsMemory(0, 8192), linked.Token); }
+                        catch (OperationCanceledException)
+                        {
+                            if (ct.IsCancellationRequested) return null;
+                            break;
+                        }
+                        catch { break; }
+                        if (n <= 0) break;
+                        ms.Write(tmp, 0, Math.Min(n, 16384 - (int)ms.Length));
+                        if (ms.Length >= 16384) break;
+                    }
+                }
+                finally { ArrayPool<byte>.Shared.Return(tmp); }
+                return ms.ToArray();
+            }
+            catch (OperationCanceledException)
+            {
+                if (ct.IsCancellationRequested) throw;
+                return Array.Empty<byte>();
+            }
+            catch { return Array.Empty<byte>(); }
+        }
+
+        public static async Task<bool> SocksConnectAsync(NetworkStream s, string host, int port, CancellationToken ct)
+        {
+            await s.WriteAsync(new byte[] { 0x05, 0x01, 0x00 }, ct);
+            var resp = new byte[2];
+            if (!await TryReadExactAsync(s, resp, ct)) return false;
+            if (resp[0] != 0x05 || resp[1] != 0x00) return false;
+
+            var req = HttpToSocksBridge.BuildSocksConnectRequest(host, port);
+            if (req == null) return false;
+
+            await s.WriteAsync(req, ct);
+            var head = new byte[4];
+            if (!await TryReadExactAsync(s, head, ct)) return false;
+            if (head[1] != 0x00) return false;
+
+            int addrLen = head[3] switch
+            {
+                0x01 => 4,
+                0x04 => 16,
+                0x03 => (await TryReadOneByteAsync(s, ct) is (true, var b) ? b : -1),
+                _ => -1
+            };
+            if (addrLen < 0) return false;
+            var skip = new byte[addrLen + 2];
+            if (!await TryReadExactAsync(s, skip, ct)) return false;
+            return true;
+        }
+
+        static async Task<(bool ok, int value)> TryReadOneByteAsync(NetworkStream s, CancellationToken ct)
+        {
+            var b = new byte[1];
+            if (!await TryReadExactAsync(s, b, ct)) return (false, 0);
+            return (true, b[0]);
+        }
+
+        // Fresh short budget for verdict replies, linked to the engine
+        // token (see ReplyAsync in HandleClientAsync): never the handshake
+        // budget, which is usually expired by the time a verdict exists.
+        static CancellationTokenSource ReplyCts(CancellationToken engineCt)
+        {
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(engineCt);
+            try { cts.CancelAfter(TimeSpan.FromSeconds(5)); } catch { }
+            return cts;
+        }
+
+        // False on graceful EOF (routine for probes/half-closes), never throws it as IOException noise.
+        static async Task<bool> TryReadExactAsync(NetworkStream s, byte[] buffer, CancellationToken ct)
+        {
+            int offset = 0;
+            while (offset < buffer.Length)
+            {
+                int read;
+                try { read = await s.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), ct); }
+                catch (OperationCanceledException) { throw; }
+                catch { return false; }
+                if (read <= 0) return false;
+                offset += read;
+            }
+            return true;
+        }
+
+        public void Dispose()
+        {
+            lock (_lifeLock)
+            {
+                try { _cts?.Cancel(); } catch { }
+                try { _listener?.Stop(); } catch { }
+                // Full reset so the next Start rebinds cleanly (no stale CTS).
+                try { _cts?.Dispose(); } catch { }
+                _cts = null;
+                _listener = null;
+            }
+        }
+    }
+}
